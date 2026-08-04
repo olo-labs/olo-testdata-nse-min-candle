@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use this dataset, please cite the repository and the exact Git commit used."
+title: "NSE India 1-Minute OHLCV Historical Market Data"
+type: dataset
+authors:
+  - name: "OLO Labs"
+repository-code: "https://github.com/olo-labs/olo-testdata-nse-min-candle"
+url: "https://github.com/olo-labs/olo-testdata-nse-min-candle"
+license: Apache-2.0
+keywords:
+  - NSE
+  - India
+  - OHLCV
+  - minute candles
+  - historical market data
+  - quantitative finance
+  - backtesting
+  - NIFTY
+abstract: >-
+  Date-partitioned CSV archives containing one-minute open, high, low, close,
+  volume, and open-interest observations for NSE instruments and indices.

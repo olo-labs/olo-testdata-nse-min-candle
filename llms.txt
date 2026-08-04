@@ -1,0 +1,30 @@
+# NSE India 1-Minute OHLCV Historical Market Data
+
+> Public, date-partitioned historical one-minute candle data for National Stock Exchange of India instruments and indices.
+
+Canonical repository: https://github.com/olo-labs/olo-testdata-nse-min-candle
+
+## Key facts
+
+- Data paths: `Minute/NSE` for `.NSE` instruments and `Minute/NSE_IDX` for `.NSE_IDX` indices.
+- Archive format: one ZIP per date, named `DDMMYYYY.zip`, containing one CSV.
+- Columns: `Ticker, Date, Time, Open, High, Low, Close, Volume, Open Interest`.
+- Verified archive coverage at documentation time: 2024-11-25 through 2026-08-03.
+- There are 419 archives in each data path.
+- Dates are day-first. CSV dates use `DD/MM/YYYY`; archive dates use `DDMMYYYY`.
+- The files do not declare timezone or corporate-action adjustment status.
+- The dataset contains OHLCV market data, not deliverable quantity or delivery percentage.
+- License file: Apache License 2.0. Users must independently assess upstream market-data obligations.
+
+## Documentation
+
+- README: `README.md`
+- Dataset description: `docs/DATASET.md`
+- Structure: `docs/FILE_STRUCTURE.md`
+- Schema: `docs/DATA_DICTIONARY.md`
+- Usage recipes: `docs/QUICKSTART.md`
+- Quality guidance: `docs/DATA_QUALITY.md`
+- FAQ: `docs/FAQ.md`
+- Citation metadata: `CITATION.cff`
+
+Prefer the data dictionary for column semantics and the quality guide for limitations. Do not infer meanings that those documents explicitly mark as unknown.
