@@ -3,18 +3,23 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$OutputDirectory = "release-assets",
 
-    # Keep comfortably below GitHub's strict 2 GiB-per-file limit.
+    # Keep each GitHub release asset safely below 2 GiB.
+    # 2,040,109,465 bytes is approximately 1.90 GiB.
     [Parameter(Mandatory = $false)]
     [long]$MaximumArchiveBytes = 2040109465,
 
-    # Group source ZIPs into extraction batches.
-    # This reduces temporary disk usage on GitHub-hosted runners.
+    # Maximum extracted CSV size accumulated in one archive part.
+    # Start conservatively and increase after observing compression ratios.
     [Parameter(Mandatory = $false)]
-    [long]$PreferredBatchSourceBytes = 1342177280
+    [long]$TargetUncompressedBytes = 1800000000
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+# --------------------------------------------------------------------
+# Resolve repository paths
+# --------------------------------------------------------------------
 
 $RepositoryRoot = (
     Resolve-Path (
@@ -22,21 +27,64 @@ $RepositoryRoot = (
     )
 ).Path
 
-$OutputDirectory = Join-Path `
-    $RepositoryRoot `
-    $OutputDirectory
+if ([IO.Path]::IsPathRooted($OutputDirectory)) {
+    $ReleaseDirectory = $OutputDirectory
+}
+else {
+    $ReleaseDirectory = Join-Path `
+        $RepositoryRoot `
+        $OutputDirectory
+}
 
-$WorkingRoot = Join-Path `
-    $env:RUNNER_TEMP `
-    "nse-minute-release-builder"
+if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+    $TemporaryRoot = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        "nse-minute-release-builder"
+}
+else {
+    $TemporaryRoot = Join-Path `
+        $env:RUNNER_TEMP `
+        "nse-minute-release-builder"
+}
+
+$ExtractionDirectory = Join-Path `
+    $TemporaryRoot `
+    "current-extraction"
+
+$PartDirectory = Join-Path `
+    $TemporaryRoot `
+    "current-part"
 
 $ManifestPath = Join-Path `
-    $OutputDirectory `
+    $ReleaseDirectory `
     "RELEASE_MANIFEST.json"
 
 $ChecksumPath = Join-Path `
-    $OutputDirectory `
+    $ReleaseDirectory `
     "SHA256SUMS.txt"
+
+# --------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------
+
+if ($MaximumArchiveBytes -le 0) {
+    throw "MaximumArchiveBytes must be greater than zero."
+}
+
+if ($TargetUncompressedBytes -le 0) {
+    throw "TargetUncompressedBytes must be greater than zero."
+}
+
+if ($TargetUncompressedBytes -ge 20GB) {
+    throw (
+        "TargetUncompressedBytes is unexpectedly large: " +
+        "$TargetUncompressedBytes"
+    )
+}
+
+# --------------------------------------------------------------------
+# Helper functions
+# --------------------------------------------------------------------
 
 function Invoke-ExternalCommand {
     param(
@@ -70,21 +118,28 @@ function Get-SevenZipExecutable {
 
     foreach ($candidate in $candidates) {
         try {
-            $resolved = Get-Command `
+            $command = Get-Command `
                 $candidate `
                 -ErrorAction Stop
 
-            return $resolved.Source
+            return $command.Source
         }
         catch {
-            # Continue checking.
+            # Continue checking candidates.
         }
     }
 
-    throw "7-Zip was not found on this runner."
+    throw @"
+7-Zip was not found.
+
+Expected one of:
+- 7z
+- 7z.exe
+- C:\Program Files\7-Zip\7z.exe
+"@
 }
 
-function Clear-Directory {
+function Reset-Directory {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path
@@ -104,61 +159,67 @@ function Clear-Directory {
         Out-Null
 }
 
-function Get-RelativePath {
+function Get-DirectorySize {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path
     )
 
-    return [IO.Path]::GetRelativePath(
-        $RepositoryRoot,
-        $Path
-    ).Replace("\", "/")
-}
+    if (-not (Test-Path $Path -PathType Container)) {
+        return [long]0
+    }
 
-function Split-FilesIntoBatches {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo[]]$Files,
-
-        [Parameter(Mandatory = $true)]
-        [long]$MaximumSourceBytes
+    $files = @(
+        Get-ChildItem `
+            -Path $Path `
+            -File `
+            -Recurse
     )
 
-    $batches = [System.Collections.Generic.List[object]]::new()
-    $currentBatch = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-    [long]$currentBytes = 0
-
-    foreach ($file in $Files) {
-        if (
-            $currentBatch.Count -gt 0 -and
-            ($currentBytes + $file.Length) -gt $MaximumSourceBytes
-        ) {
-            $batches.Add(
-                @($currentBatch.ToArray())
-            )
-
-            $currentBatch = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-            $currentBytes = 0
-        }
-
-        $currentBatch.Add($file)
-        $currentBytes += $file.Length
+    if ($files.Count -eq 0) {
+        return [long]0
     }
 
-    if ($currentBatch.Count -gt 0) {
-        $batches.Add(
-            @($currentBatch.ToArray())
-        )
-    }
-
-    return $batches.ToArray()
+    return [long](
+        $files |
+        Measure-Object `
+            -Property Length `
+            -Sum
+    ).Sum
 }
 
-function Expand-SourceArchives {
+function Get-ChronologicalArchiveDate {
     param(
         [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo[]]$SourceArchives,
+        [System.IO.FileInfo]$Archive
+    )
+
+    $baseName = $Archive.BaseName
+
+    if ($baseName -match '^\d{8}$') {
+        try {
+            return [datetime]::ParseExact(
+                $baseName,
+                "ddMMyyyy",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        catch {
+            Write-Warning (
+                "Unable to parse archive date from filename: " +
+                $Archive.Name
+            )
+        }
+    }
+
+    # Unknown filenames are placed after date-named archives.
+    return [datetime]::MaxValue
+}
+
+function Expand-DailyArchive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo]$Archive,
 
         [Parameter(Mandatory = $true)]
         [string]$Destination,
@@ -167,87 +228,93 @@ function Expand-SourceArchives {
         [string]$SevenZip
     )
 
-    Clear-Directory $Destination
+    Reset-Directory $Destination
 
-    foreach ($sourceArchive in $SourceArchives) {
-        Write-Host (
-            "Extracting " +
-            (Get-RelativePath $sourceArchive.FullName)
-        )
-
-        Invoke-ExternalCommand `
-            -Command $SevenZip `
-            -Arguments @(
-                "x",
-                $sourceArchive.FullName,
-                "-o$Destination",
-                "-y",
-                "-bso0",
-                "-bsp0"
-            )
-    }
-}
-
-function New-ZipArchive {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SourceDirectory,
-
-        [Parameter(Mandatory = $true)]
-        [string]$ArchivePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$SevenZip
-    )
-
-    if (Test-Path $ArchivePath) {
-        Remove-Item `
-            -Path $ArchivePath `
-            -Force
-    }
-
-    $sourceWildcard = Join-Path `
-        $SourceDirectory `
-        "*"
+    Write-Host ""
+    Write-Host "Extracting source archive: $($Archive.Name)"
 
     Invoke-ExternalCommand `
         -Command $SevenZip `
         -Arguments @(
-            "a",
-            "-tzip",
-            "-mx=7",
-            "-mmt=on",
-            $ArchivePath,
-            $sourceWildcard,
-            "-r",
+            "x",
+            $Archive.FullName,
+            "-o$Destination",
             "-y",
             "-bso0",
             "-bsp0"
         )
 
-    if (-not (Test-Path $ArchivePath -PathType Leaf)) {
-        throw "Archive was not created: $ArchivePath"
+    $files = @(
+        Get-ChildItem `
+            -Path $Destination `
+            -File `
+            -Recurse
+    )
+
+    if ($files.Count -eq 0) {
+        throw (
+            "Source archive contains no extracted files: " +
+            $Archive.FullName
+        )
     }
 
-    $archive = Get-Item $ArchivePath
-
-    if ($archive.Length -le 0) {
-        throw "Archive is empty: $ArchivePath"
-    }
-
-    return $archive
+    return $files
 }
 
-function Build-ArchiveBatch {
+function Move-ExtractedFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileInfo[]]$Files,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceArchiveName
+    )
+
+    foreach ($file in $Files) {
+        $destinationPath = Join-Path `
+            $Destination `
+            $file.Name
+
+        # Protect against duplicate CSV member names.
+        if (Test-Path $destinationPath) {
+            $sourcePrefix = [IO.Path]::GetFileNameWithoutExtension(
+                $SourceArchiveName
+            )
+
+            $destinationName = (
+                $sourcePrefix +
+                "-" +
+                $file.Name
+            )
+
+            $destinationPath = Join-Path `
+                $Destination `
+                $destinationName
+        }
+
+        Move-Item `
+            -Path $file.FullName `
+            -Destination $destinationPath `
+            -Force
+    }
+}
+
+function New-ConsolidatedArchive {
     param(
         [Parameter(Mandatory = $true)]
         [string]$DatasetName,
 
         [Parameter(Mandatory = $true)]
-        [System.IO.FileInfo[]]$SourceArchives,
+        [int]$PartNumber,
 
         [Parameter(Mandatory = $true)]
-        [int]$RequestedPartNumber,
+        [string]$SourceDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$SourceArchives,
 
         [Parameter(Mandatory = $true)]
         [string]$SevenZip,
@@ -256,189 +323,115 @@ function Build-ArchiveBatch {
         [long]$MaximumBytes
     )
 
-    $results = [System.Collections.Generic.List[object]]::new()
-
     if ($SourceArchives.Count -eq 0) {
-        return $results.ToArray()
+        throw "Cannot create an archive without source archive names."
     }
 
-    $batchIdentity = (
-        $DatasetName +
-        "-" +
-        $RequestedPartNumber +
-        "-" +
-        [Guid]::NewGuid().ToString("N")
+    $sourceFiles = @(
+        Get-ChildItem `
+            -Path $SourceDirectory `
+            -File `
+            -Recurse
     )
 
-    $extractDirectory = Join-Path `
-        $WorkingRoot `
-        $batchIdentity
-
-    Expand-SourceArchives `
-        -SourceArchives $SourceArchives `
-        -Destination $extractDirectory `
-        -SevenZip $SevenZip
+    if ($sourceFiles.Count -eq 0) {
+        throw "Cannot create an archive without extracted files."
+    }
 
     $archiveName = "{0}-part-{1:D3}.zip" -f `
         $DatasetName, `
-        $RequestedPartNumber
+        $PartNumber
 
     $archivePath = Join-Path `
-        $OutputDirectory `
+        $ReleaseDirectory `
         $archiveName
 
-    $archive = New-ZipArchive `
-        -SourceDirectory $extractDirectory `
-        -ArchivePath $archivePath `
-        -SevenZip $SevenZip
-
-    Remove-Item `
-        -Path $extractDirectory `
-        -Recurse `
-        -Force
-
-    if ($archive.Length -lt $MaximumBytes) {
-        $results.Add(
-            [PSCustomObject]@{
-                dataset            = $DatasetName
-                temporaryPart      = $RequestedPartNumber
-                archivePath        = $archive.FullName
-                archiveName        = $archive.Name
-                archiveBytes       = $archive.Length
-                sourceArchiveCount = $SourceArchives.Count
-                firstSource        = $SourceArchives[0].Name
-                lastSource         = $SourceArchives[-1].Name
-            }
-        )
-
-        return $results.ToArray()
+    if (Test-Path $archivePath) {
+        Remove-Item `
+            -Path $archivePath `
+            -Force
     }
 
-    Write-Warning (
-        "$archiveName is too large: " +
-        "$($archive.Length) bytes. Splitting the batch."
-    )
+    $sourceWildcard = Join-Path `
+        $SourceDirectory `
+        "*"
 
-    Remove-Item `
-        -Path $archive.FullName `
-        -Force
+    Write-Host ""
+    Write-Host "Creating consolidated archive: $archiveName"
 
-    if ($SourceArchives.Count -le 1) {
+    Invoke-ExternalCommand `
+        -Command $SevenZip `
+        -Arguments @(
+            "a",
+            "-tzip",
+            "-mx=7",
+            "-mmt=on",
+            $archivePath,
+            $sourceWildcard,
+            "-r",
+            "-y",
+            "-bso0",
+            "-bsp0"
+        )
+
+    if (-not (Test-Path $archivePath -PathType Leaf)) {
+        throw "Consolidated ZIP was not created: $archivePath"
+    }
+
+    $archive = Get-Item $archivePath
+
+    if ($archive.Length -le 0) {
+        throw "Consolidated ZIP is empty: $archiveName"
+    }
+
+    if ($archive.Length -ge $MaximumBytes) {
         throw @"
-A single daily source archive produces a consolidated asset larger than the
-configured release limit.
+Generated archive exceeds the configured release limit.
 
-Source: $($SourceArchives[0].FullName)
-Generated size: $($archive.Length)
-Limit: $MaximumBytes
+Archive: $archiveName
+Size: $($archive.Length) bytes
+Limit: $MaximumBytes bytes
+
+Reduce TargetUncompressedBytes and run the workflow again.
 "@
     }
 
-    $middle = [Math]::Floor(
-        $SourceArchives.Count / 2
-    )
-
-    $left = @(
-        $SourceArchives[0..($middle - 1)]
-    )
-
-    $right = @(
-        $SourceArchives[$middle..($SourceArchives.Count - 1)]
-    )
-
-    $leftResults = Build-ArchiveBatch `
-        -DatasetName $DatasetName `
-        -SourceArchives $left `
-        -RequestedPartNumber $RequestedPartNumber `
-        -SevenZip $SevenZip `
-        -MaximumBytes $MaximumBytes
-
-    foreach ($result in $leftResults) {
-        $results.Add($result)
-    }
-
-    $nextNumber = (
-        $RequestedPartNumber +
-        $leftResults.Count
-    )
-
-    $rightResults = Build-ArchiveBatch `
-        -DatasetName $DatasetName `
-        -SourceArchives $right `
-        -RequestedPartNumber $nextNumber `
-        -SevenZip $SevenZip `
-        -MaximumBytes $MaximumBytes
-
-    foreach ($result in $rightResults) {
-        $results.Add($result)
-    }
-
-    return $results.ToArray()
-}
-
-function Rename-ArchiveParts {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object[]]$ArchiveResults,
-
-        [Parameter(Mandatory = $true)]
-        [string]$DatasetName
-    )
-
-    $renamed = [System.Collections.Generic.List[object]]::new()
-    $ordered = @(
-        $ArchiveResults |
-        Sort-Object `
-            firstSource, `
-            lastSource
-    )
-
-    for ($index = 0; $index -lt $ordered.Count; $index++) {
-        $partNumber = $index + 1
-
-        $newName = "{0}-part-{1:D3}.zip" -f `
-            $DatasetName, `
-            $partNumber
-
-        $newPath = Join-Path `
-            $OutputDirectory `
-            $newName
-
-        if (
-            $ordered[$index].archivePath -ne $newPath
-        ) {
-            if (Test-Path $newPath) {
-                Remove-Item `
-                    -Path $newPath `
-                    -Force
-            }
-
-            Move-Item `
-                -Path $ordered[$index].archivePath `
-                -Destination $newPath `
-                -Force
-        }
-
-        $file = Get-Item $newPath
-
-        $renamed.Add(
-            [PSCustomObject]@{
-                dataset            = $DatasetName
-                part               = $partNumber
-                archiveName        = $file.Name
-                archivePath        = $file.FullName
-                archiveBytes       = $file.Length
-                sourceArchiveCount = $ordered[$index].sourceArchiveCount
-                firstSource        = $ordered[$index].firstSource
-                lastSource         = $ordered[$index].lastSource
-            }
+    # Validate archive integrity before publishing.
+    Invoke-ExternalCommand `
+        -Command $SevenZip `
+        -Arguments @(
+            "t",
+            $archive.FullName,
+            "-bso0",
+            "-bsp0"
         )
-    }
 
-    return $renamed.ToArray()
+    $uncompressedBytes = Get-DirectorySize `
+        -Path $SourceDirectory
+
+    Write-Host ""
+    Write-Host "Archive created successfully:"
+    Write-Host " - Name: $archiveName"
+    Write-Host " - Source daily ZIPs: $($SourceArchives.Count)"
+    Write-Host " - First source: $($SourceArchives[0])"
+    Write-Host " - Last source: $($SourceArchives[-1])"
+    Write-Host " - Uncompressed bytes: $uncompressedBytes"
+    Write-Host " - Compressed bytes: $($archive.Length)"
+
+    return [PSCustomObject]@{
+        dataset            = $DatasetName
+        part               = $PartNumber
+        file               = $archive.Name
+        path               = $archive.FullName
+        bytes              = $archive.Length
+        uncompressedBytes  = $uncompressedBytes
+        sourceArchiveCount = $SourceArchives.Count
+        firstSourceArchive = $SourceArchives[0]
+        lastSourceArchive  = $SourceArchives[-1]
+    }
 }
 
-function Build-DatasetArchives {
+function Build-Dataset {
     param(
         [Parameter(Mandatory = $true)]
         [string]$DatasetName,
@@ -453,122 +446,198 @@ function Build-DatasetArchives {
         [long]$MaximumBytes,
 
         [Parameter(Mandatory = $true)]
-        [long]$BatchSourceBytes
+        [long]$TargetBytes
     )
 
     if (-not (Test-Path $SourceDirectory -PathType Container)) {
         throw "Dataset directory does not exist: $SourceDirectory"
     }
 
-    $sourceArchives = @(
+    $dailyArchives = @(
         Get-ChildItem `
             -Path $SourceDirectory `
             -Filter "*.zip" `
             -File |
-        Sort-Object Name
+        Sort-Object `
+            @{ Expression = { Get-ChronologicalArchiveDate $_ } }, `
+            @{ Expression = { $_.Name } }
     )
 
-    if ($sourceArchives.Count -eq 0) {
-        throw "No source ZIP files found in $SourceDirectory"
+    if ($dailyArchives.Count -eq 0) {
+        throw "No daily ZIP files found in: $SourceDirectory"
     }
 
     Write-Host ""
+    Write-Host "======================================================"
     Write-Host "Building dataset: $DatasetName"
-    Write-Host "Source archives: $($sourceArchives.Count)"
+    Write-Host "Source directory: $SourceDirectory"
+    Write-Host "Daily source ZIPs: $($dailyArchives.Count)"
+    Write-Host "======================================================"
 
-    $sourceBytes = (
-        $sourceArchives |
-        Measure-Object `
-            -Property Length `
-            -Sum
-    ).Sum
+    $results = [System.Collections.Generic.List[object]]::new()
+    $currentSources = [System.Collections.Generic.List[string]]::new()
 
-    Write-Host "Source compressed bytes: $sourceBytes"
+    Reset-Directory $PartDirectory
+    Reset-Directory $ExtractionDirectory
 
-    $batches = Split-FilesIntoBatches `
-        -Files $sourceArchives `
-        -MaximumSourceBytes $BatchSourceBytes
+    [long]$currentPartBytes = 0
+    [int]$partNumber = 1
 
-    $allResults = [System.Collections.Generic.List[object]]::new()
-    $partNumber = 1
-
-    foreach ($batch in $batches) {
-        $batchFiles = @($batch)
-
-        Write-Host ""
-        Write-Host (
-            "Processing batch with " +
-            "$($batchFiles.Count) daily source archives."
+    foreach ($dailyArchive in $dailyArchives) {
+        $extractedFiles = @(
+            Expand-DailyArchive `
+                -Archive $dailyArchive `
+                -Destination $ExtractionDirectory `
+                -SevenZip $SevenZip
         )
 
-        $batchResults = Build-ArchiveBatch `
+        $extractedBytes = [long](
+            $extractedFiles |
+            Measure-Object `
+                -Property Length `
+                -Sum
+        ).Sum
+
+        if ($extractedBytes -le 0) {
+            throw (
+                "Extracted source archive has zero bytes: " +
+                $dailyArchive.Name
+            )
+        }
+
+        if ($extractedBytes -ge $TargetBytes) {
+            throw @"
+A single daily source archive expands beyond the configured part target.
+
+Archive: $($dailyArchive.Name)
+Extracted bytes: $extractedBytes
+Target bytes: $TargetBytes
+"@
+        }
+
+        # Finalize the current part before adding a daily archive that
+        # would exceed the target extracted size.
+        if (
+            $currentSources.Count -gt 0 -and
+            ($currentPartBytes + $extractedBytes) -gt $TargetBytes
+        ) {
+            $result = New-ConsolidatedArchive `
+                -DatasetName $DatasetName `
+                -PartNumber $partNumber `
+                -SourceDirectory $PartDirectory `
+                -SourceArchives $currentSources.ToArray() `
+                -SevenZip $SevenZip `
+                -MaximumBytes $MaximumBytes
+
+            $results.Add($result)
+
+            $partNumber++
+            $currentSources.Clear()
+            $currentPartBytes = 0
+
+            Reset-Directory $PartDirectory
+        }
+
+        Move-ExtractedFiles `
+            -Files $extractedFiles `
+            -Destination $PartDirectory `
+            -SourceArchiveName $dailyArchive.Name
+
+        $currentSources.Add($dailyArchive.Name)
+        $currentPartBytes += $extractedBytes
+
+        Write-Host (
+            "Current part extracted bytes: " +
+            "$currentPartBytes / $TargetBytes"
+        )
+
+        Reset-Directory $ExtractionDirectory
+    }
+
+    # Finalize the last part.
+    if ($currentSources.Count -gt 0) {
+        $result = New-ConsolidatedArchive `
             -DatasetName $DatasetName `
-            -SourceArchives $batchFiles `
-            -RequestedPartNumber $partNumber `
+            -PartNumber $partNumber `
+            -SourceDirectory $PartDirectory `
+            -SourceArchives $currentSources.ToArray() `
             -SevenZip $SevenZip `
             -MaximumBytes $MaximumBytes
 
-        foreach ($result in $batchResults) {
-            $allResults.Add($result)
-        }
-
-        $partNumber += $batchResults.Count
+        $results.Add($result)
     }
 
-    return Rename-ArchiveParts `
-        -ArchiveResults $allResults.ToArray() `
-        -DatasetName $DatasetName
+    Reset-Directory $PartDirectory
+    Reset-Directory $ExtractionDirectory
+
+    return $results.ToArray()
 }
+
+# --------------------------------------------------------------------
+# Main execution
+# --------------------------------------------------------------------
 
 $SevenZip = Get-SevenZipExecutable
 
-Clear-Directory $OutputDirectory
-Clear-Directory $WorkingRoot
+Reset-Directory $ReleaseDirectory
+Reset-Directory $TemporaryRoot
 
-$NseSource = Join-Path `
+$NseDirectory = Join-Path `
     $RepositoryRoot `
     "Minute\NSE"
 
-$IndexSource = Join-Path `
+$IndexDirectory = Join-Path `
     $RepositoryRoot `
     "Minute\NSE_IDX"
 
 $allAssets = [System.Collections.Generic.List[object]]::new()
 
-# NSE stock data: one or more archives, each safely below 2 GiB.
-$nseAssets = Build-DatasetArchives `
+# NSE stock and exchange-traded instrument dataset.
+$nseAssets = Build-Dataset `
     -DatasetName "NSE-Minute" `
-    -SourceDirectory $NseSource `
+    -SourceDirectory $NseDirectory `
     -SevenZip $SevenZip `
     -MaximumBytes $MaximumArchiveBytes `
-    -BatchSourceBytes $PreferredBatchSourceBytes
+    -TargetBytes $TargetUncompressedBytes
 
 foreach ($asset in $nseAssets) {
     $allAssets.Add($asset)
 }
 
-# NSE index data: always maintained separately from stock data.
-$indexAssets = Build-DatasetArchives `
+# NSE index dataset remains completely separate.
+$indexAssets = Build-Dataset `
     -DatasetName "NSE-Index-Minute" `
-    -SourceDirectory $IndexSource `
+    -SourceDirectory $IndexDirectory `
     -SevenZip $SevenZip `
     -MaximumBytes $MaximumArchiveBytes `
-    -BatchSourceBytes $PreferredBatchSourceBytes
+    -TargetBytes $TargetUncompressedBytes
 
 foreach ($asset in $indexAssets) {
     $allAssets.Add($asset)
 }
 
+if ($allAssets.Count -eq 0) {
+    throw "No consolidated release archives were generated."
+}
+
+# --------------------------------------------------------------------
+# Generate checksums and manifest
+# --------------------------------------------------------------------
+
 $manifestAssets = [System.Collections.Generic.List[object]]::new()
 $checksumLines = [System.Collections.Generic.List[string]]::new()
 
 foreach ($asset in $allAssets) {
-    $file = Get-Item $asset.archivePath
+    $file = Get-Item $asset.path
+
+    if ($file.Length -le 0) {
+        throw "Generated release archive is empty: $($file.Name)"
+    }
 
     if ($file.Length -ge $MaximumArchiveBytes) {
         throw (
-            "Generated asset exceeds the configured limit: " +
-            "$($file.Name)"
+            "Generated archive exceeds the configured limit: " +
+            $file.Name
         )
     }
 
@@ -590,10 +659,11 @@ foreach ($asset in $allAssets) {
                 $file.Length / 1GB,
                 4
             )
+            uncompressedBytes  = $asset.uncompressedBytes
             sha256             = $hash.Hash.ToLower()
             sourceArchiveCount = $asset.sourceArchiveCount
-            firstSourceArchive = $asset.firstSource
-            lastSourceArchive  = $asset.lastSource
+            firstSourceArchive = $asset.firstSourceArchive
+            lastSourceArchive  = $asset.lastSourceArchive
         }
     )
 }
@@ -603,7 +673,8 @@ $manifest = [ordered]@{
         Get-Date
     ).ToUniversalTime().ToString("o")
 
-    maximumArchiveBytes = $MaximumArchiveBytes
+    maximumArchiveBytes     = $MaximumArchiveBytes
+    targetUncompressedBytes = $TargetUncompressedBytes
 
     source = [ordered]@{
         nseDirectory   = "Minute/NSE"
@@ -625,27 +696,44 @@ $checksumLines |
         -Path $ChecksumPath `
         -Encoding ascii
 
+if (-not (Test-Path $ManifestPath -PathType Leaf)) {
+    throw "Release manifest was not created."
+}
+
+if (-not (Test-Path $ChecksumPath -PathType Leaf)) {
+    throw "Checksum file was not created."
+}
+
+# --------------------------------------------------------------------
+# Final output
+# --------------------------------------------------------------------
+
 Write-Host ""
-Write-Host "Release archives created:"
-Write-Host ""
+Write-Host "======================================================"
+Write-Host "Release package completed"
+Write-Host "======================================================"
 
 foreach ($asset in $manifestAssets) {
     Write-Host (
         " - " +
         $asset.file +
-        " (" +
+        " | " +
         $asset.gibibytes +
-        " GiB)"
+        " GiB | " +
+        $asset.sourceArchiveCount +
+        " source ZIPs"
     )
 }
 
 Write-Host ""
+Write-Host "Release directory: $ReleaseDirectory"
 Write-Host "Manifest: $ManifestPath"
 Write-Host "Checksums: $ChecksumPath"
 
-if ($env:GITHUB_ENV) {
-    "RELEASE_ASSET_DIRECTORY=$OutputDirectory" >> $env:GITHUB_ENV
+# Export values for subsequent GitHub Actions steps.
+if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
+    "RELEASE_ASSET_DIRECTORY=$ReleaseDirectory" >> $env:GITHUB_ENV
     "RELEASE_MANIFEST=$ManifestPath" >> $env:GITHUB_ENV
     "RELEASE_CHECKSUMS=$ChecksumPath" >> $env:GITHUB_ENV
-    "RELEASE_ASSET_COUNT=$($manifestAssets.Count)" >> $env:GITHUB_ENV
+    "RELEASE_DATA_ASSET_COUNT=$($manifestAssets.Count)" >> $env:GITHUB_ENV
 }

@@ -1,48 +1,55 @@
-name: Manual versioned NSE minute-data release
+name: Rolling NSE minute-data release
 
 on:
+  push:
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version, for example v1.0.0"
-        required: true
-        type: string
-
-      release_title:
-        description: "Optional release title"
-        required: false
-        default: ""
-        type: string
-
-      prerelease:
-        description: "Mark as a pre-release"
+      force_release:
+        description: "Create the rolling release manually"
         required: true
         default: false
-        type: boolean
-
-      make_latest:
-        description: "Mark as latest GitHub release"
-        required: true
-        default: true
         type: boolean
 
 permissions:
   contents: write
 
 concurrency:
-  group: nse-minute-versioned-${{ inputs.version }}
+  group: nse-minute-rolling-release
   cancel-in-progress: false
 
 env:
-  RELEASE_TEMPLATE: .github/release-notes/version.md
-  RELEASE_ASSET_DIRECTORY: release-assets
+  RELEASE_TAG: nse-minute-latest
+  RELEASE_TITLE: Latest NSE One-Minute OHLCV Data
+
+  RELEASE_TEMPLATE_RELATIVE: .github/release-notes/latest.md
+  RELEASE_ASSET_DIRECTORY_RELATIVE: release-assets
+  RELEASE_NOTES_NAME: RELEASE_NOTES.md
+
+  # Approximately 1.90 GiB.
+  MAXIMUM_ARCHIVE_BYTES: "2040109465"
+
+  # Conservative initial target based on extracted CSV size.
+  TARGET_UNCOMPRESSED_BYTES: "1800000000"
+
+  # Prevent accidental generation of one release archive per trading day.
+  MAXIMUM_DATA_ARCHIVE_COUNT: "30"
 
 jobs:
-  versioned-release:
+  rolling-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'RC:')
+
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
+      # ---------------------------------------------------------------
+      # Checkout repository and Git LFS content
+      # ---------------------------------------------------------------
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -55,45 +62,315 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           git lfs install
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Git LFS initialization failed."
+          }
+
           git lfs pull
 
           if ($LASTEXITCODE -ne 0) {
               throw "Downloading Git LFS objects failed."
           }
 
-      - name: Validate version
+      # ---------------------------------------------------------------
+      # Validate rolling-release trigger
+      # ---------------------------------------------------------------
+      - name: Validate rolling release request
         shell: pwsh
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          FORCE_RELEASE: ${{ inputs.force_release }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = $env:INPUT_VERSION.Trim()
+          if ($env:EVENT_NAME -eq "push") {
+              $message = $env:COMMIT_MESSAGE
 
-          if (
-              $version -notmatch
-              '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$'
-          ) {
-              throw "Invalid release version: $version"
+              if ([string]::IsNullOrWhiteSpace($message)) {
+                  throw "The push event does not contain a commit message."
+              }
+
+              if (
+                  -not $message.StartsWith(
+                      "RC:",
+                      [StringComparison]::Ordinal
+                  )
+              ) {
+                  throw (
+                      "The commit message must start exactly with 'RC:'. " +
+                      "Received: $message"
+                  )
+              }
+
+              Write-Host "RC commit detected:"
+              Write-Host $message
+          }
+          else {
+              if ($env:FORCE_RELEASE -ne "true") {
+                  throw (
+                      "For a manual rolling release, " +
+                      "set force_release to true."
+                  )
+              }
+
+              Write-Host "Manual rolling release requested."
           }
 
-          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+      # ---------------------------------------------------------------
+      # Resolve absolute paths
+      # ---------------------------------------------------------------
+      - name: Resolve release paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
+          $templatePath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              $env:RELEASE_TEMPLATE_RELATIVE
+
+          $assetDirectory = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              $env:RELEASE_ASSET_DIRECTORY_RELATIVE
+
+          $notesPath = Join-Path `
+              $assetDirectory `
+              $env:RELEASE_NOTES_NAME
+
+          "RELEASE_TEMPLATE=$templatePath" >> $env:GITHUB_ENV
+          "RELEASE_ASSET_DIRECTORY=$assetDirectory" >> $env:GITHUB_ENV
+          "RELEASE_NOTES=$notesPath" >> $env:GITHUB_ENV
+
+          Write-Host "Release template: $templatePath"
+          Write-Host "Release asset directory: $assetDirectory"
+          Write-Host "Release notes: $notesPath"
+
+      # ---------------------------------------------------------------
+      # Validate repository source files
+      # ---------------------------------------------------------------
+      - name: Validate repository release inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredDirectories = @(
+              "Minute/NSE",
+              "Minute/NSE_IDX"
+          )
+
+          foreach ($relativeDirectory in $requiredDirectories) {
+              $directory = Join-Path `
+                  $env:GITHUB_WORKSPACE `
+                  $relativeDirectory
+
+              if (-not (Test-Path $directory -PathType Container)) {
+                  throw "Required directory does not exist: $directory"
+              }
+
+              $sourceArchives = @(
+                  Get-ChildItem `
+                      -Path $directory `
+                      -Filter "*.zip" `
+                      -File
+              )
+
+              if ($sourceArchives.Count -eq 0) {
+                  throw "No source ZIP files found in: $directory"
+              }
+
+              $totalBytes = (
+                  $sourceArchives |
+                  Measure-Object `
+                      -Property Length `
+                      -Sum
+              ).Sum
+
+              $totalGiB = [Math]::Round(
+                  $totalBytes / 1GB,
+                  3
+              )
+
+              Write-Host "Dataset: $relativeDirectory"
+              Write-Host " - Daily ZIP files: $($sourceArchives.Count)"
+              Write-Host " - Compressed size: $totalGiB GiB"
+          }
+
+          if (-not (Test-Path $env:RELEASE_TEMPLATE -PathType Leaf)) {
+              Write-Host "Available files under .github:"
+
+              Get-ChildItem `
+                  -Path (
+                      Join-Path `
+                          $env:GITHUB_WORKSPACE `
+                          ".github"
+                  ) `
+                  -File `
+                  -Recurse `
+                  -ErrorAction SilentlyContinue |
+                  ForEach-Object {
+                      Write-Host " - $($_.FullName)"
+                  }
+
+              throw (
+                  "Rolling release template does not exist: " +
+                  $env:RELEASE_TEMPLATE
+              )
+          }
+
+          $builderPath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "scripts/Build-ReleaseArchives.ps1"
+
+          if (-not (Test-Path $builderPath -PathType Leaf)) {
+              throw "Archive builder does not exist: $builderPath"
+          }
+
+      # ---------------------------------------------------------------
+      # Build consolidated archives
+      # ---------------------------------------------------------------
       - name: Build consolidated release archives
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          & ".\scripts\Build-ReleaseArchives.ps1" `
-              -OutputDirectory "release-assets" `
-              -MaximumArchiveBytes 2040109465 `
-              -PreferredBatchSourceBytes 1342177280
+          $builderPath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "scripts/Build-ReleaseArchives.ps1"
+
+          & $builderPath `
+              -OutputDirectory $env:RELEASE_ASSET_DIRECTORY_RELATIVE `
+              -MaximumArchiveBytes ([long]$env:MAXIMUM_ARCHIVE_BYTES) `
+              -TargetUncompressedBytes ([long]$env:TARGET_UNCOMPRESSED_BYTES)
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Building release archives failed."
+              throw "Building consolidated release archives failed."
           }
 
-      - name: Prepare license
+          if (
+              -not (
+                  Test-Path `
+                      -Path $env:RELEASE_ASSET_DIRECTORY `
+                      -PathType Container
+              )
+          ) {
+              throw (
+                  "Release asset directory was not created: " +
+                  $env:RELEASE_ASSET_DIRECTORY
+              )
+          }
+
+      # ---------------------------------------------------------------
+      # Validate archive output
+      # ---------------------------------------------------------------
+      - name: Validate consolidated release archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path $env:RELEASE_MANIFEST -PathType Leaf)) {
+              throw "Release manifest was not generated."
+          }
+
+          if (-not (Test-Path $env:RELEASE_CHECKSUMS -PathType Leaf)) {
+              throw "SHA256SUMS.txt was not generated."
+          }
+
+          $manifest = Get-Content `
+              -Path $env:RELEASE_MANIFEST `
+              -Raw |
+              ConvertFrom-Json
+
+          $assets = @($manifest.assets)
+
+          if ($assets.Count -eq 0) {
+              throw "The release manifest contains no data archives."
+          }
+
+          $maximumParts = [int]$env:MAXIMUM_DATA_ARCHIVE_COUNT
+
+          if ($assets.Count -gt $maximumParts) {
+              throw @"
+          Too many consolidated archives were generated: $($assets.Count)
+
+          Maximum allowed by this workflow: $maximumParts
+
+          The archive builder may be creating one release ZIP for each
+          daily source archive instead of consolidating extracted CSV files.
+          "@
+          }
+
+          $nseAssets = @(
+              $assets |
+              Where-Object {
+                  $_.dataset -eq "NSE-Minute"
+              }
+          )
+
+          $indexAssets = @(
+              $assets |
+              Where-Object {
+                  $_.dataset -eq "NSE-Index-Minute"
+              }
+          )
+
+          if ($nseAssets.Count -eq 0) {
+              throw "No consolidated NSE stock archives were generated."
+          }
+
+          if ($indexAssets.Count -eq 0) {
+              throw "No consolidated NSE index archives were generated."
+          }
+
+          $maximumBytes = [long]$env:MAXIMUM_ARCHIVE_BYTES
+
+          foreach ($asset in $assets) {
+              $assetPath = Join-Path `
+                  $env:RELEASE_ASSET_DIRECTORY `
+                  $asset.file
+
+              if (-not (Test-Path $assetPath -PathType Leaf)) {
+                  throw "Manifest asset does not exist: $assetPath"
+              }
+
+              $file = Get-Item $assetPath
+
+              if ($file.Length -le 0) {
+                  throw "Generated archive is empty: $($file.Name)"
+              }
+
+              if ($file.Length -ge $maximumBytes) {
+                  throw (
+                      "Generated archive exceeds the configured limit: " +
+                      "$($file.Name) ($($file.Length) bytes)"
+                  )
+              }
+
+              if (
+                  [string]::IsNullOrWhiteSpace(
+                      [string]$asset.sha256
+                  )
+              ) {
+                  throw (
+                      "Manifest checksum is missing for: " +
+                      $asset.file
+                  )
+              }
+          }
+
+          "NSE_PART_COUNT=$($nseAssets.Count)" >> $env:GITHUB_ENV
+          "INDEX_PART_COUNT=$($indexAssets.Count)" >> $env:GITHUB_ENV
+          "RELEASE_DATA_ASSET_COUNT=$($assets.Count)" >> $env:GITHUB_ENV
+
+          Write-Host "Archive validation passed."
+          Write-Host "NSE stock parts: $($nseAssets.Count)"
+          Write-Host "NSE index parts: $($indexAssets.Count)"
+          Write-Host "Total data archives: $($assets.Count)"
+
+      # ---------------------------------------------------------------
+      # Prepare license asset
+      # ---------------------------------------------------------------
+      - name: Prepare license asset
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -105,36 +382,61 @@ jobs:
           )
 
           $sourceLicense = $licenseCandidates |
+              ForEach-Object {
+                  Join-Path `
+                      $env:GITHUB_WORKSPACE `
+                      $_
+              } |
               Where-Object {
                   Test-Path $_ -PathType Leaf
               } |
               Select-Object -First 1
 
           if (-not $sourceLicense) {
-              throw "No license file was found."
+              throw @"
+          No repository license file was found.
+
+          Add one of:
+          - LICENSE
+          - LICENSE.txt
+          - LICENSE.md
+          "@
           }
 
-          $target = Join-Path `
+          $licensePath = Join-Path `
               $env:RELEASE_ASSET_DIRECTORY `
               "LICENSE"
 
           Copy-Item `
               -Path $sourceLicense `
-              -Destination $target `
+              -Destination $licensePath `
               -Force
 
-          "RELEASE_LICENSE_ASSET=$target" >> $env:GITHUB_ENV
+          if (-not (Test-Path $licensePath -PathType Leaf)) {
+              throw "Failed to prepare the release license."
+          }
 
-      - name: Generate versioned release notes
+          $license = Get-Item $licensePath
+
+          if ($license.Length -le 0) {
+              throw "Prepared release license is empty."
+          }
+
+          "RELEASE_LICENSE=$licensePath" >> $env:GITHUB_ENV
+
+          Write-Host "License asset: $licensePath"
+
+      # ---------------------------------------------------------------
+      # Generate rolling release notes
+      # ---------------------------------------------------------------
+      - name: Generate rolling release notes
         shell: pwsh
         env:
-          INPUT_RELEASE_TITLE: ${{ inputs.release_title }}
+          TARGET_COMMIT: ${{ github.sha }}
+          PUSH_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           $ErrorActionPreference = "Stop"
-
-          if (-not (Test-Path $env:RELEASE_TEMPLATE -PathType Leaf)) {
-              throw "Version release template was not found."
-          }
 
           $manifest = Get-Content `
               -Path $env:RELEASE_MANIFEST `
@@ -143,13 +445,13 @@ jobs:
 
           $assetRows = @(
               foreach ($asset in $manifest.assets) {
-                  $size = [Math]::Round(
-                      $asset.bytes / 1GB,
+                  $sizeGiB = [Math]::Round(
+                      [double]$asset.bytes / 1GB,
                       3
                   )
 
                   "| ``$($asset.file)`` | $($asset.dataset) | " +
-                  "$($asset.sourceArchiveCount) | $size GiB |"
+                  "$($asset.sourceArchiveCount) | $sizeGiB GiB |"
               }
           ) -join [Environment]::NewLine
 
@@ -167,32 +469,49 @@ jobs:
               }
           ).Count
 
-          $utcNow = (Get-Date).ToUniversalTime()
-          $commit = "${{ github.sha }}"
+          $commit = $env:TARGET_COMMIT.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($commit)) {
+              throw "Rolling release commit is empty."
+          }
 
           $shortCommit = $commit.Substring(
               0,
               [Math]::Min(7, $commit.Length)
           )
 
-          $notesPath = Join-Path `
-              $env:RELEASE_ASSET_DIRECTORY `
-              "RELEASE_NOTES-$env:RELEASE_VERSION.md"
+          if ($env:EVENT_NAME -eq "push") {
+              $commitMessage = $env:PUSH_COMMIT_MESSAGE
+          }
+          else {
+              $commitMessage = "Manual rolling release"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($commitMessage)) {
+              $commitMessage = "Rolling release"
+          }
+
+          # Prevent a multiline commit body from damaging Markdown layout.
+          $commitMessage = (
+              $commitMessage -split "\r?\n"
+          )[0].Trim()
+
+          $utcNow = (Get-Date).ToUniversalTime()
 
           $content = Get-Content `
               -Path $env:RELEASE_TEMPLATE `
               -Raw
 
           $replacements = [ordered]@{
-              "{{VERSION}}"       = $env:RELEASE_VERSION
-              "{{DATE}}"          = $utcNow.ToString("yyyy-MM-dd")
-              "{{TIME}}"          = $utcNow.ToString("HH:mm:ss")
-              "{{COMMIT}}"        = $commit
-              "{{SHORT_COMMIT}}"  = $shortCommit
-              "{{NSE_PARTS}}"     = [string]$nseParts
-              "{{INDEX_PARTS}}"   = [string]$indexParts
-              "{{ASSET_COUNT}}"   = [string]$manifest.assets.Count
-              "{{ASSET_TABLE}}"   = $assetRows
+              "{{DATE}}"           = $utcNow.ToString("yyyy-MM-dd")
+              "{{TIME}}"           = $utcNow.ToString("HH:mm:ss")
+              "{{COMMIT}}"         = $commit
+              "{{SHORT_COMMIT}}"   = $shortCommit
+              "{{COMMIT_MESSAGE}}" = $commitMessage
+              "{{NSE_PARTS}}"      = [string]$nseParts
+              "{{INDEX_PARTS}}"    = [string]$indexParts
+              "{{ASSET_COUNT}}"    = [string]$manifest.assets.Count
+              "{{ASSET_TABLE}}"    = $assetRows
           }
 
           foreach ($placeholder in $replacements.Keys) {
@@ -203,69 +522,44 @@ jobs:
           }
 
           Set-Content `
-              -Path $notesPath `
+              -Path $env:RELEASE_NOTES `
               -Value $content `
               -Encoding utf8
 
-          $requestedTitle = $env:INPUT_RELEASE_TITLE.Trim()
+          if (-not (Test-Path $env:RELEASE_NOTES -PathType Leaf)) {
+              throw "Rolling release notes were not created."
+          }
 
-          if ([string]::IsNullOrWhiteSpace($requestedTitle)) {
-              $releaseTitle = (
-                  "NSE One-Minute OHLCV Data " +
-                  $env:RELEASE_VERSION
+          $notesFile = Get-Item $env:RELEASE_NOTES
+
+          if ($notesFile.Length -le 0) {
+              throw "Generated rolling release notes are empty."
+          }
+
+          $remainingPlaceholders = Select-String `
+              -Path $env:RELEASE_NOTES `
+              -Pattern '\{\{[A-Z0-9_]+\}\}' `
+              -AllMatches
+
+          if ($remainingPlaceholders) {
+              $unresolved = @(
+                  $remainingPlaceholders.Matches.Value |
+                  Sort-Object -Unique
+              )
+
+              throw (
+                  "Unresolved release-note placeholders: " +
+                  ($unresolved -join ", ")
               )
           }
-          else {
-              $releaseTitle = $requestedTitle
-          }
 
-          "RELEASE_NOTES=$notesPath" >> $env:GITHUB_ENV
-          "RELEASE_TITLE=$releaseTitle" >> $env:GITHUB_ENV
+          Write-Host "Rolling release notes generated."
+          Write-Host "Release notes: $env:RELEASE_NOTES"
 
-      - name: Detect existing versioned release
-        id: release_state
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release view `
-              $env:RELEASE_VERSION `
-              --json tagName `
-              *> $null
-
-          if ($LASTEXITCODE -eq 0) {
-              "exists=true" >> $env:GITHUB_OUTPUT
-          }
-          else {
-              "exists=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Create or move version tag
-        shell: pwsh
-        env:
-          TARGET_COMMIT: ${{ github.sha }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          git tag `
-              --force `
-              $env:RELEASE_VERSION `
-              $env:TARGET_COMMIT
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Creating or updating the version tag failed."
-          }
-
-          git push `
-              origin `
-              "refs/tags/$env:RELEASE_VERSION" `
-              --force
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Pushing the version tag failed."
-          }
-
-      - name: Find versioned release assets
+      # ---------------------------------------------------------------
+      # Build complete release asset list
+      # ---------------------------------------------------------------
+      - name: Find rolling release assets
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -278,15 +572,68 @@ jobs:
                   $_.Extension -eq ".zip" -or
                   $_.Name -eq "RELEASE_MANIFEST.json" -or
                   $_.Name -eq "SHA256SUMS.txt" -or
-                  $_.Name -eq "LICENSE" -or
-                  $_.Name -like "RELEASE_NOTES-*.md"
+                  $_.Name -eq "RELEASE_NOTES.md" -or
+                  $_.Name -eq "LICENSE"
               } |
               Sort-Object Name
           )
 
+          if ($assets.Count -eq 0) {
+              throw "No rolling release assets were found."
+          }
+
+          $zipAssets = @(
+              $assets |
+              Where-Object {
+                  $_.Extension -eq ".zip"
+              }
+          )
+
+          if ($zipAssets.Count -eq 0) {
+              throw "No ZIP release archives were found."
+          }
+
+          $requiredNames = @(
+              "RELEASE_MANIFEST.json",
+              "SHA256SUMS.txt",
+              "RELEASE_NOTES.md",
+              "LICENSE"
+          )
+
+          $assetNames = @(
+              $assets |
+              ForEach-Object {
+                  $_.Name
+              }
+          )
+
+          foreach ($requiredName in $requiredNames) {
+              if ($requiredName -notin $assetNames) {
+                  throw "Required release asset is missing: $requiredName"
+              }
+          }
+
+          $maximumBytes = [long]$env:MAXIMUM_ARCHIVE_BYTES
+
+          foreach ($asset in $assets) {
+              if ($asset.Length -le 0) {
+                  throw "Release asset is empty: $($asset.Name)"
+              }
+
+              if (
+                  $asset.Extension -eq ".zip" -and
+                  $asset.Length -ge $maximumBytes
+              ) {
+                  throw (
+                      "Release ZIP exceeds the configured limit: " +
+                      "$($asset.Name)"
+                  )
+              }
+          }
+
           $assetListPath = Join-Path `
               $env:RUNNER_TEMP `
-              "versioned-assets.txt"
+              "rolling-release-assets.txt"
 
           $assets.FullName |
               Set-Content `
@@ -294,25 +641,112 @@ jobs:
                   -Encoding utf8
 
           "RELEASE_ASSET_LIST=$assetListPath" >> $env:GITHUB_ENV
+          "RELEASE_TOTAL_ASSET_COUNT=$($assets.Count)" >> $env:GITHUB_ENV
 
-      - name: Create versioned release
+          Write-Host "Rolling release assets selected: $($assets.Count)"
+
+          foreach ($asset in $assets) {
+              $sizeMiB = [Math]::Round(
+                  $asset.Length / 1MB,
+                  2
+              )
+
+              Write-Host " - $($asset.Name): $sizeMiB MiB"
+          }
+
+      # ---------------------------------------------------------------
+      # Detect existing rolling release
+      # ---------------------------------------------------------------
+      - name: Detect existing rolling release
+        id: release_state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          gh release view `
+              $env:RELEASE_TAG `
+              --json tagName `
+              *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Rolling release already exists."
+              "exists=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              Write-Host "Rolling release does not exist."
+              "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      # ---------------------------------------------------------------
+      # Create or force-move rolling tag
+      # ---------------------------------------------------------------
+      - name: Update rolling Git tag
+        shell: pwsh
+        env:
+          TARGET_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $target = $env:TARGET_COMMIT.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($target)) {
+              throw "Rolling release target commit is empty."
+          }
+
+          git tag `
+              --force `
+              $env:RELEASE_TAG `
+              $target
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Updating the local rolling tag failed."
+          }
+
+          git push `
+              origin `
+              "refs/tags/$env:RELEASE_TAG" `
+              --force
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Pushing the rolling tag failed."
+          }
+
+          Write-Host (
+              "Rolling tag " +
+              $env:RELEASE_TAG +
+              " now points to " +
+              $target
+          )
+
+      # ---------------------------------------------------------------
+      # Create new rolling release
+      # ---------------------------------------------------------------
+      - name: Create rolling release
         if: steps.release_state.outputs.exists == 'false'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
-          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $assets = @(
-              Get-Content $env:RELEASE_ASSET_LIST
+              Get-Content `
+                  -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
           )
+
+          if ($assets.Count -eq 0) {
+              throw "The rolling release asset list is empty."
+          }
 
           $arguments = @(
               "release",
               "create",
-              $env:RELEASE_VERSION
+              $env:RELEASE_TAG
           )
 
           $arguments += $assets
@@ -322,73 +756,22 @@ jobs:
               $env:RELEASE_TITLE,
               "--notes-file",
               $env:RELEASE_NOTES,
-              "--verify-tag"
+              "--verify-tag",
+              "--latest"
           )
-
-          if ($env:INPUT_PRERELEASE -eq "true") {
-              $arguments += "--prerelease"
-          }
-
-          if (
-              $env:INPUT_MAKE_LATEST -eq "true" -and
-              $env:INPUT_PRERELEASE -ne "true"
-          ) {
-              $arguments += "--latest"
-          }
-          else {
-              $arguments += "--latest=false"
-          }
 
           & gh @arguments
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Creating versioned release failed."
+              throw "Creating the rolling release failed."
           }
 
-      - name: Update existing release metadata
-        if: steps.release_state.outputs.exists == 'true'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_PRERELEASE: ${{ inputs.prerelease }}
-          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
-        run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "Rolling release created."
 
-          $arguments = @(
-              "release",
-              "edit",
-              $env:RELEASE_VERSION,
-              "--title",
-              $env:RELEASE_TITLE,
-              "--notes-file",
-              $env:RELEASE_NOTES
-          )
-
-          if ($env:INPUT_PRERELEASE -eq "true") {
-              $arguments += "--prerelease"
-          }
-          else {
-              $arguments += "--prerelease=false"
-          }
-
-          if (
-              $env:INPUT_MAKE_LATEST -eq "true" -and
-              $env:INPUT_PRERELEASE -ne "true"
-          ) {
-              $arguments += "--latest"
-          }
-          else {
-              $arguments += "--latest=false"
-          }
-
-          & gh @arguments
-
-          if ($LASTEXITCODE -ne 0) {
-              throw "Updating versioned release metadata failed."
-          }
-
-      - name: Delete old versioned assets
+      # ---------------------------------------------------------------
+      # Update existing release metadata
+      # ---------------------------------------------------------------
+      - name: Update rolling release metadata
         if: steps.release_state.outputs.exists == 'true'
         shell: pwsh
         env:
@@ -396,26 +779,63 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $release = gh release view `
-              $env:RELEASE_VERSION `
-              --json assets |
+          gh release edit `
+              $env:RELEASE_TAG `
+              --title $env:RELEASE_TITLE `
+              --notes-file $env:RELEASE_NOTES `
+              --latest
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Updating rolling release metadata failed."
+          }
+
+          Write-Host "Rolling release metadata updated."
+
+      # ---------------------------------------------------------------
+      # Delete old assets
+      #
+      # This ensures obsolete part files do not remain when the number
+      # of NSE or index parts changes.
+      # ---------------------------------------------------------------
+      - name: Delete old rolling release assets
+        if: steps.release_state.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseJson = gh release view `
+              $env:RELEASE_TAG `
+              --json assets
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Reading existing rolling release assets failed."
+          }
+
+          $release = $releaseJson |
               ConvertFrom-Json
 
-          foreach ($asset in $release.assets) {
+          foreach ($asset in @($release.assets)) {
+              Write-Host "Deleting old asset: $($asset.name)"
+
               gh release delete-asset `
-                  $env:RELEASE_VERSION `
+                  $env:RELEASE_TAG `
                   $asset.name `
                   --yes
 
               if ($LASTEXITCODE -ne 0) {
                   throw (
-                      "Deleting asset failed: " +
+                      "Deleting old rolling release asset failed: " +
                       $asset.name
                   )
               }
           }
 
-      - name: Upload replacement versioned assets
+      # ---------------------------------------------------------------
+      # Upload replacement assets
+      # ---------------------------------------------------------------
+      - name: Upload replacement rolling release assets
         if: steps.release_state.outputs.exists == 'true'
         shell: pwsh
         env:
@@ -424,13 +844,21 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $assets = @(
-              Get-Content $env:RELEASE_ASSET_LIST
+              Get-Content `
+                  -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
           )
+
+          if ($assets.Count -eq 0) {
+              throw "The replacement asset list is empty."
+          }
 
           $arguments = @(
               "release",
               "upload",
-              $env:RELEASE_VERSION
+              $env:RELEASE_TAG
           )
 
           $arguments += $assets
@@ -438,10 +866,15 @@ jobs:
           & gh @arguments
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Uploading versioned assets failed."
+              throw "Uploading replacement rolling release assets failed."
           }
 
-      - name: Verify versioned release
+          Write-Host "Replacement rolling release assets uploaded."
+
+      # ---------------------------------------------------------------
+      # Verify release and expected assets
+      # ---------------------------------------------------------------
+      - name: Verify rolling release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -449,39 +882,90 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $expectedAssets = @(
-              Get-Content $env:RELEASE_ASSET_LIST |
+              Get-Content `
+                  -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              } |
               ForEach-Object {
                   Split-Path $_ -Leaf
               }
           )
 
-          $release = gh release view `
-              $env:RELEASE_VERSION `
-              --json assets,url |
+          $releaseJson = gh release view `
+              $env:RELEASE_TAG `
+              --json `
+              tagName,name,isDraft,isPrerelease,assets,url
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Reading the rolling release failed."
+          }
+
+          $release = $releaseJson |
               ConvertFrom-Json
 
           $publishedAssets = @(
-              $release.assets.name
+              $release.assets |
+              ForEach-Object {
+                  $_.name
+              }
           )
 
-          foreach ($asset in $expectedAssets) {
-              if ($asset -notin $publishedAssets) {
-                  throw "Missing published asset: $asset"
+          foreach ($expectedAsset in $expectedAssets) {
+              if ($expectedAsset -notin $publishedAssets) {
+                  throw (
+                      "Expected rolling release asset is missing: " +
+                      $expectedAsset
+                  )
               }
+          }
+
+          $unexpectedAssets = @(
+              $publishedAssets |
+              Where-Object {
+                  $_ -notin $expectedAssets
+              }
+          )
+
+          if ($unexpectedAssets.Count -gt 0) {
+              throw (
+                  "Unexpected old rolling release assets remain: " +
+                  ($unexpectedAssets -join ", ")
+              )
           }
 
           "RELEASE_URL=$($release.url)" >> $env:GITHUB_ENV
 
+          Write-Host "Rolling release verification passed."
+          Write-Host "Release URL: $($release.url)"
+
+      # ---------------------------------------------------------------
+      # Workflow summary
+      # ---------------------------------------------------------------
       - name: Write workflow summary
         if: success()
         shell: pwsh
         run: |
-          @"
-          ## NSE Minute Versioned Release
+          if (
+              "${{ steps.release_state.outputs.exists }}" -eq
+              "true"
+          ) {
+              $operation = "Updated rolling release"
+          }
+          else {
+              $operation = "Created rolling release"
+          }
 
-          - **Version:** ``$env:RELEASE_VERSION``
+          @"
+          ## NSE Minute Rolling Release
+
+          - **Operation:** $operation
+          - **Tag:** ``$env:RELEASE_TAG``
           - **Title:** $env:RELEASE_TITLE
-          - **Assets:** $env:RELEASE_ASSET_COUNT
+          - **NSE archive parts:** $env:NSE_PART_COUNT
+          - **Index archive parts:** $env:INDEX_PART_COUNT
+          - **Data archives:** $env:RELEASE_DATA_ASSET_COUNT
+          - **Total release assets:** $env:RELEASE_TOTAL_ASSET_COUNT
           - **Commit:** ``${{ github.sha }}``
           - **Release:** $env:RELEASE_URL
           "@ >> $env:GITHUB_STEP_SUMMARY

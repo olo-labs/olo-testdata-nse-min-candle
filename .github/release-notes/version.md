@@ -17,7 +17,7 @@ commit `{{SHORT_COMMIT}}`.
 
 | Asset           | Dataset | Daily source ZIPs | Size |
 | --------------- | ------- | ----------------: | ---: |
-{{ASSET_TABLE}}
+| {{ASSET_TABLE}} |         |                   |      |
 
 ## Archive structure
 
@@ -32,13 +32,14 @@ NSE-Index-Minute-part-001.zip
 ...
 ```
 
-All daily ZIP files stored in the repository are extracted during packaging.
+All daily source ZIP files stored in the repository are extracted during
+packaging.
 
 The consolidated release archives contain CSV files directly rather than nested
 daily ZIP archives.
 
-Every individual release archive is kept below the configured 2 GiB release
-asset limit.
+Each generated archive is kept below the configured GitHub release-asset size
+limit.
 
 ## Dataset contents
 
@@ -56,15 +57,46 @@ Each normal one-minute candle row contains:
 
 ## Additional release assets
 
+The release also includes:
+
 * `RELEASE_MANIFEST.json`
 * `SHA256SUMS.txt`
 * `RELEASE_NOTES-{{VERSION}}.md`
 * `LICENSE`
 
-Use `SHA256SUMS.txt` to verify downloaded release assets.
+`RELEASE_MANIFEST.json` records:
 
-The manifest records the archive filename, dataset, part number, size, checksum,
-source archive count, and source archive range for every generated data asset.
+* Dataset name
+* Archive part number
+* Archive filename
+* Compressed size
+* Uncompressed size
+* SHA-256 checksum
+* Source daily ZIP count
+* First source archive
+* Last source archive
+
+Use `SHA256SUMS.txt` to verify downloaded archive integrity.
+
+## Versioned release behavior
+
+This release is created manually from GitHub Actions using a semantic version
+such as:
+
+```text
+v1.0.0
+```
+
+Running the workflow again with the same version intentionally:
+
+* Moves the version tag to the current selected commit
+* Updates the release title and release notes
+* Deletes the previous release assets
+* Uploads the newly generated archive parts
+* Removes obsolete archive parts when the part count changes
+
+This means version tags in this repository are mutable when the same workflow
+version is rerun.
 
 ## Data interpretation
 
@@ -74,7 +106,7 @@ timestamp convention before assigning a timezone.
 Prices are not adjusted for stock splits, dividends, bonus issues, rights
 issues, or other corporate actions unless independently verified.
 
-Absence of a candle does not necessarily represent zero trading activity. An
+The absence of a candle does not necessarily indicate zero trading activity. An
 instrument may not trade during every minute.
 
 Index volume and open-interest values may be zero in the source data.
@@ -85,9 +117,8 @@ Repository code, documentation, and original project content are provided under
 the Apache License 2.0.
 
 The project license does not grant ownership of, or additional rights over, the
-underlying market data. Users are responsible for reviewing any applicable
-upstream data terms and local requirements before using or redistributing the
-dataset.
+underlying market data. Users are responsible for reviewing applicable upstream
+data terms and local requirements before using or redistributing the dataset.
 
 ## Disclaimer
 

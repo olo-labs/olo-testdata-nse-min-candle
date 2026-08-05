@@ -15,13 +15,13 @@ on:
         type: string
 
       prerelease:
-        description: "Mark as a pre-release"
+        description: "Mark this release as a pre-release"
         required: true
         default: false
         type: boolean
 
       make_latest:
-        description: "Mark as the latest GitHub release"
+        description: "Mark this release as latest"
         required: true
         default: true
         type: boolean
@@ -38,16 +38,18 @@ env:
   RELEASE_ASSET_DIRECTORY_RELATIVE: release-assets
 
   # Approximately 1.90 GiB.
-  # Every generated ZIP must remain below this value.
   MAXIMUM_ARCHIVE_BYTES: "2040109465"
 
-  # Prevent accidental publication of one archive per trading day.
-  MAXIMUM_DATA_ARCHIVE_COUNT: "20"
+  # Conservative initial target based on extracted CSV size.
+  TARGET_UNCOMPRESSED_BYTES: "1800000000"
+
+  # Prevent accidental generation of one archive per trading day.
+  MAXIMUM_DATA_ARCHIVE_COUNT: "30"
 
 jobs:
   versioned-release:
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     steps:
       # ---------------------------------------------------------------
@@ -77,29 +79,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # Resolve repository paths
-      # ---------------------------------------------------------------
-      - name: Resolve release paths
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $templatePath = Join-Path `
-              $env:GITHUB_WORKSPACE `
-              $env:RELEASE_TEMPLATE_RELATIVE
-
-          $assetDirectory = Join-Path `
-              $env:GITHUB_WORKSPACE `
-              $env:RELEASE_ASSET_DIRECTORY_RELATIVE
-
-          "RELEASE_TEMPLATE=$templatePath" >> $env:GITHUB_ENV
-          "RELEASE_ASSET_DIRECTORY=$assetDirectory" >> $env:GITHUB_ENV
-
-          Write-Host "Template: $templatePath"
-          Write-Host "Asset directory: $assetDirectory"
-
-      # ---------------------------------------------------------------
-      # Validate requested semantic version
+      # Validate semantic version
       # ---------------------------------------------------------------
       - name: Validate release version
         shell: pwsh
@@ -108,7 +88,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $version = $env:INPUT_VERSION.Trim()
+          $version = $env:INPUT_VERSION
+
+          if ($null -eq $version) {
+              $version = ""
+          }
+
+          $version = $version.Trim()
 
           if (
               $version -notmatch
@@ -130,9 +116,31 @@ jobs:
           Write-Host "Release version: $version"
 
       # ---------------------------------------------------------------
-      # Validate repository inputs
+      # Resolve absolute paths
       # ---------------------------------------------------------------
-      - name: Validate source datasets and templates
+      - name: Resolve release paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $templatePath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              $env:RELEASE_TEMPLATE_RELATIVE
+
+          $assetDirectory = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              $env:RELEASE_ASSET_DIRECTORY_RELATIVE
+
+          "RELEASE_TEMPLATE=$templatePath" >> $env:GITHUB_ENV
+          "RELEASE_ASSET_DIRECTORY=$assetDirectory" >> $env:GITHUB_ENV
+
+          Write-Host "Release template: $templatePath"
+          Write-Host "Release asset directory: $assetDirectory"
+
+      # ---------------------------------------------------------------
+      # Validate repository source files
+      # ---------------------------------------------------------------
+      - name: Validate repository release inputs
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -142,34 +150,28 @@ jobs:
               "Minute/NSE_IDX"
           )
 
-          foreach ($directory in $requiredDirectories) {
-              $absoluteDirectory = Join-Path `
+          foreach ($relativeDirectory in $requiredDirectories) {
+              $directory = Join-Path `
                   $env:GITHUB_WORKSPACE `
-                  $directory
+                  $relativeDirectory
 
-              if (
-                  -not (
-                      Test-Path `
-                          -Path $absoluteDirectory `
-                          -PathType Container
-                  )
-              ) {
+              if (-not (Test-Path $directory -PathType Container)) {
                   throw "Required directory does not exist: $directory"
               }
 
-              $zipFiles = @(
+              $sourceArchives = @(
                   Get-ChildItem `
-                      -Path $absoluteDirectory `
+                      -Path $directory `
                       -Filter "*.zip" `
                       -File
               )
 
-              if ($zipFiles.Count -eq 0) {
+              if ($sourceArchives.Count -eq 0) {
                   throw "No source ZIP files found in: $directory"
               }
 
               $totalBytes = (
-                  $zipFiles |
+                  $sourceArchives |
                   Measure-Object `
                       -Property Length `
                       -Sum
@@ -180,19 +182,13 @@ jobs:
                   3
               )
 
-              Write-Host "Dataset: $directory"
-              Write-Host "ZIP files: $($zipFiles.Count)"
-              Write-Host "Compressed size: $totalGiB GiB"
+              Write-Host "Dataset: $relativeDirectory"
+              Write-Host " - Daily ZIP files: $($sourceArchives.Count)"
+              Write-Host " - Compressed size: $totalGiB GiB"
           }
 
-          if (
-              -not (
-                  Test-Path `
-                      -Path $env:RELEASE_TEMPLATE `
-                      -PathType Leaf
-              )
-          ) {
-              Write-Host "Files under .github:"
+          if (-not (Test-Path $env:RELEASE_TEMPLATE -PathType Leaf)) {
+              Write-Host "Available files under .github:"
 
               Get-ChildItem `
                   -Path (
@@ -208,7 +204,7 @@ jobs:
                   }
 
               throw (
-                  "Version release template was not found: " +
+                  "Versioned release template does not exist: " +
                   $env:RELEASE_TEMPLATE
               )
           }
@@ -218,11 +214,11 @@ jobs:
               "scripts/Build-ReleaseArchives.ps1"
 
           if (-not (Test-Path $builderPath -PathType Leaf)) {
-              throw "Archive builder was not found: $builderPath"
+              throw "Archive builder does not exist: $builderPath"
           }
 
       # ---------------------------------------------------------------
-      # Build consolidated NSE and NSE index archives
+      # Build consolidated archives
       # ---------------------------------------------------------------
       - name: Build consolidated release archives
         shell: pwsh
@@ -236,7 +232,7 @@ jobs:
           & $builderPath `
               -OutputDirectory $env:RELEASE_ASSET_DIRECTORY_RELATIVE `
               -MaximumArchiveBytes ([long]$env:MAXIMUM_ARCHIVE_BYTES) `
-              -PreferredBatchSourceBytes 1342177280
+              -TargetUncompressedBytes ([long]$env:TARGET_UNCOMPRESSED_BYTES)
 
           if ($LASTEXITCODE -ne 0) {
               throw "Building consolidated release archives failed."
@@ -256,62 +252,54 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # Validate archive builder output
+      # Validate archive output
       # ---------------------------------------------------------------
-      - name: Validate consolidated archive output
+      - name: Validate consolidated release archives
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $manifestPath = Join-Path `
-              $env:RELEASE_ASSET_DIRECTORY `
-              "RELEASE_MANIFEST.json"
-
-          $checksumsPath = Join-Path `
-              $env:RELEASE_ASSET_DIRECTORY `
-              "SHA256SUMS.txt"
-
-          if (-not (Test-Path $manifestPath -PathType Leaf)) {
-              throw "Release manifest does not exist: $manifestPath"
+          if (-not (Test-Path $env:RELEASE_MANIFEST -PathType Leaf)) {
+              throw "Release manifest was not generated."
           }
 
-          if (-not (Test-Path $checksumsPath -PathType Leaf)) {
-              throw "Checksum file does not exist: $checksumsPath"
+          if (-not (Test-Path $env:RELEASE_CHECKSUMS -PathType Leaf)) {
+              throw "SHA256SUMS.txt was not generated."
           }
 
           $manifest = Get-Content `
-              -Path $manifestPath `
+              -Path $env:RELEASE_MANIFEST `
               -Raw |
               ConvertFrom-Json
 
-          $dataAssets = @($manifest.assets)
+          $assets = @($manifest.assets)
 
-          if ($dataAssets.Count -eq 0) {
+          if ($assets.Count -eq 0) {
               throw "The release manifest contains no data archives."
           }
 
           $maximumParts = [int]$env:MAXIMUM_DATA_ARCHIVE_COUNT
 
-          if ($dataAssets.Count -gt $maximumParts) {
+          if ($assets.Count -gt $maximumParts) {
               throw @"
-          Too many consolidated archives were generated: $($dataAssets.Count)
+          Too many consolidated archives were generated: $($assets.Count)
 
           Maximum allowed by this workflow: $maximumParts
 
-          The archive builder may be creating one release ZIP for each daily
-          source ZIP instead of combining extracted CSV files into larger parts.
+          The archive builder may be creating one release ZIP for each
+          daily source archive instead of consolidating extracted CSV files.
           "@
           }
 
           $nseAssets = @(
-              $dataAssets |
+              $assets |
               Where-Object {
                   $_.dataset -eq "NSE-Minute"
               }
           )
 
           $indexAssets = @(
-              $dataAssets |
+              $assets |
               Where-Object {
                   $_.dataset -eq "NSE-Index-Minute"
               }
@@ -327,7 +315,7 @@ jobs:
 
           $maximumBytes = [long]$env:MAXIMUM_ARCHIVE_BYTES
 
-          foreach ($asset in $dataAssets) {
+          foreach ($asset in $assets) {
               $assetPath = Join-Path `
                   $env:RELEASE_ASSET_DIRECTORY `
                   $asset.file
@@ -348,21 +336,30 @@ jobs:
                       "$($file.Name) ($($file.Length) bytes)"
                   )
               }
+
+              if (
+                  [string]::IsNullOrWhiteSpace(
+                      [string]$asset.sha256
+                  )
+              ) {
+                  throw (
+                      "Manifest checksum is missing for: " +
+                      $asset.file
+                  )
+              }
           }
 
-          "RELEASE_MANIFEST=$manifestPath" >> $env:GITHUB_ENV
-          "RELEASE_CHECKSUMS=$checksumsPath" >> $env:GITHUB_ENV
-          "RELEASE_DATA_ASSET_COUNT=$($dataAssets.Count)" >> $env:GITHUB_ENV
           "NSE_PART_COUNT=$($nseAssets.Count)" >> $env:GITHUB_ENV
           "INDEX_PART_COUNT=$($indexAssets.Count)" >> $env:GITHUB_ENV
+          "RELEASE_DATA_ASSET_COUNT=$($assets.Count)" >> $env:GITHUB_ENV
 
           Write-Host "Archive validation passed."
           Write-Host "NSE stock parts: $($nseAssets.Count)"
           Write-Host "NSE index parts: $($indexAssets.Count)"
-          Write-Host "Total data archives: $($dataAssets.Count)"
+          Write-Host "Total data archives: $($assets.Count)"
 
       # ---------------------------------------------------------------
-      # Copy license to release-assets
+      # Prepare license asset
       # ---------------------------------------------------------------
       - name: Prepare license asset
         shell: pwsh
@@ -397,22 +394,28 @@ jobs:
           "@
           }
 
-          $targetLicense = Join-Path `
+          $licensePath = Join-Path `
               $env:RELEASE_ASSET_DIRECTORY `
               "LICENSE"
 
           Copy-Item `
               -Path $sourceLicense `
-              -Destination $targetLicense `
+              -Destination $licensePath `
               -Force
 
-          if (-not (Test-Path $targetLicense -PathType Leaf)) {
-              throw "Failed to prepare license asset."
+          if (-not (Test-Path $licensePath -PathType Leaf)) {
+              throw "Failed to prepare the release license."
           }
 
-          "RELEASE_LICENSE=$targetLicense" >> $env:GITHUB_ENV
+          $license = Get-Item $licensePath
 
-          Write-Host "License asset: $targetLicense"
+          if ($license.Length -le 0) {
+              throw "Prepared release license is empty."
+          }
+
+          "RELEASE_LICENSE=$licensePath" >> $env:GITHUB_ENV
+
+          Write-Host "License asset: $licensePath"
 
       # ---------------------------------------------------------------
       # Generate versioned release notes
@@ -420,8 +423,8 @@ jobs:
       - name: Generate versioned release notes
         shell: pwsh
         env:
-          INPUT_RELEASE_TITLE: ${{ inputs.release_title }}
           TARGET_COMMIT: ${{ github.sha }}
+          INPUT_RELEASE_TITLE: ${{ inputs.release_title }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -459,7 +462,7 @@ jobs:
           $commit = $env:TARGET_COMMIT.Trim()
 
           if ([string]::IsNullOrWhiteSpace($commit)) {
-              throw "Target commit is empty."
+              throw "Versioned release commit is empty."
           }
 
           $shortCommit = $commit.Substring(
@@ -469,15 +472,15 @@ jobs:
 
           $utcNow = (Get-Date).ToUniversalTime()
 
-          $notesName = (
+          $releaseNotesName = (
               "RELEASE_NOTES-" +
               $env:RELEASE_VERSION +
               ".md"
           )
 
-          $notesPath = Join-Path `
+          $releaseNotesPath = Join-Path `
               $env:RELEASE_ASSET_DIRECTORY `
-              $notesName
+              $releaseNotesName
 
           $content = Get-Content `
               -Path $env:RELEASE_TEMPLATE `
@@ -503,22 +506,22 @@ jobs:
           }
 
           Set-Content `
-              -Path $notesPath `
+              -Path $releaseNotesPath `
               -Value $content `
               -Encoding utf8
 
-          if (-not (Test-Path $notesPath -PathType Leaf)) {
-              throw "Release notes were not created: $notesPath"
+          if (-not (Test-Path $releaseNotesPath -PathType Leaf)) {
+              throw "Versioned release notes were not created."
           }
 
-          $notesFile = Get-Item $notesPath
+          $notesFile = Get-Item $releaseNotesPath
 
           if ($notesFile.Length -le 0) {
-              throw "Generated release notes are empty."
+              throw "Generated versioned release notes are empty."
           }
 
           $remainingPlaceholders = Select-String `
-              -Path $notesPath `
+              -Path $releaseNotesPath `
               -Pattern '\{\{[A-Z0-9_]+\}\}' `
               -AllMatches
 
@@ -529,7 +532,7 @@ jobs:
               )
 
               throw (
-                  "Generated release notes contain unresolved placeholders: " +
+                  "Unresolved release-note placeholders: " +
                   ($unresolved -join ", ")
               )
           }
@@ -552,14 +555,15 @@ jobs:
               $releaseTitle = $requestedTitle
           }
 
-          "RELEASE_NOTES=$notesPath" >> $env:GITHUB_ENV
+          "RELEASE_NOTES=$releaseNotesPath" >> $env:GITHUB_ENV
+          "RELEASE_NOTES_NAME=$releaseNotesName" >> $env:GITHUB_ENV
           "RELEASE_TITLE=$releaseTitle" >> $env:GITHUB_ENV
 
-          Write-Host "Release notes: $notesPath"
+          Write-Host "Release notes: $releaseNotesPath"
           Write-Host "Release title: $releaseTitle"
 
       # ---------------------------------------------------------------
-      # Build and validate complete release asset list
+      # Build complete release asset list
       # ---------------------------------------------------------------
       - name: Find versioned release assets
         shell: pwsh
@@ -574,12 +578,8 @@ jobs:
                   $_.Extension -eq ".zip" -or
                   $_.Name -eq "RELEASE_MANIFEST.json" -or
                   $_.Name -eq "SHA256SUMS.txt" -or
-                  $_.Name -eq "LICENSE" -or
-                  $_.Name -eq (
-                      "RELEASE_NOTES-" +
-                      $env:RELEASE_VERSION +
-                      ".md"
-                  )
+                  $_.Name -eq $env:RELEASE_NOTES_NAME -or
+                  $_.Name -eq "LICENSE"
               } |
               Sort-Object Name
           )
@@ -596,14 +596,34 @@ jobs:
           )
 
           if ($zipAssets.Count -eq 0) {
-              throw "No ZIP data archives were found."
+              throw "No ZIP release archives were found."
+          }
+
+          $requiredNames = @(
+              "RELEASE_MANIFEST.json",
+              "SHA256SUMS.txt",
+              $env:RELEASE_NOTES_NAME,
+              "LICENSE"
+          )
+
+          $assetNames = @(
+              $assets |
+              ForEach-Object {
+                  $_.Name
+              }
+          )
+
+          foreach ($requiredName in $requiredNames) {
+              if ($requiredName -notin $assetNames) {
+                  throw "Required release asset is missing: $requiredName"
+              }
           }
 
           $maximumBytes = [long]$env:MAXIMUM_ARCHIVE_BYTES
 
           foreach ($asset in $assets) {
               if ($asset.Length -le 0) {
-                  throw "Release asset is empty: $($asset.FullName)"
+                  throw "Release asset is empty: $($asset.Name)"
               }
 
               if (
@@ -611,7 +631,7 @@ jobs:
                   $asset.Length -ge $maximumBytes
               ) {
                   throw (
-                      "ZIP asset exceeds the configured limit: " +
+                      "Release ZIP exceeds the configured limit: " +
                       "$($asset.Name)"
                   )
               }
@@ -629,7 +649,7 @@ jobs:
           "RELEASE_ASSET_LIST=$assetListPath" >> $env:GITHUB_ENV
           "RELEASE_TOTAL_ASSET_COUNT=$($assets.Count)" >> $env:GITHUB_ENV
 
-          Write-Host "Release assets selected: $($assets.Count)"
+          Write-Host "Versioned release assets selected: $($assets.Count)"
 
           foreach ($asset in $assets) {
               $sizeMiB = [Math]::Round(
@@ -641,7 +661,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # Detect whether the release already exists
+      # Detect existing release
       # ---------------------------------------------------------------
       - name: Detect existing versioned release
         id: release_state
@@ -657,18 +677,18 @@ jobs:
               *> $null
 
           if ($LASTEXITCODE -eq 0) {
-              Write-Host "Release already exists."
+              Write-Host "Versioned release already exists."
               "exists=true" >> $env:GITHUB_OUTPUT
           }
           else {
-              Write-Host "Release does not exist."
+              Write-Host "Versioned release does not exist."
               "exists=false" >> $env:GITHUB_OUTPUT
           }
 
       # ---------------------------------------------------------------
       # Create or force-move version tag
       #
-      # Re-running v1.0.0 will move the tag to the current commit.
+      # Re-running v1.0.0 moves that tag to the current commit.
       # ---------------------------------------------------------------
       - name: Create or move version tag
         shell: pwsh
@@ -677,10 +697,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $target = $env:TARGET_COMMIT.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($target)) {
+              throw "Versioned release target commit is empty."
+          }
+
           git tag `
               --force `
               $env:RELEASE_VERSION `
-              $env:TARGET_COMMIT
+              $target
 
           if ($LASTEXITCODE -ne 0) {
               throw "Creating or updating the version tag failed."
@@ -696,14 +722,14 @@ jobs:
           }
 
           Write-Host (
-              "Tag " +
+              "Version tag " +
               $env:RELEASE_VERSION +
               " now points to " +
-              $env:TARGET_COMMIT
+              $target
           )
 
       # ---------------------------------------------------------------
-      # Create a new release and upload all assets
+      # Create a new versioned release
       # ---------------------------------------------------------------
       - name: Create versioned release
         if: steps.release_state.outputs.exists == 'false'
@@ -717,8 +743,15 @@ jobs:
 
           $assets = @(
               Get-Content `
-                  -Path $env:RELEASE_ASSET_LIST
+                  -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
           )
+
+          if ($assets.Count -eq 0) {
+              throw "The versioned release asset list is empty."
+          }
 
           $arguments = @(
               "release",
@@ -753,15 +786,15 @@ jobs:
           & gh @arguments
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Creating versioned release failed."
+              throw "Creating the versioned release failed."
           }
 
           Write-Host "Versioned release created."
 
       # ---------------------------------------------------------------
-      # Update metadata for an existing release
+      # Update existing release metadata
       # ---------------------------------------------------------------
-      - name: Update existing release metadata
+      - name: Update versioned release metadata
         if: steps.release_state.outputs.exists == 'true'
         shell: pwsh
         env:
@@ -804,13 +837,13 @@ jobs:
               throw "Updating versioned release metadata failed."
           }
 
-          Write-Host "Existing release metadata updated."
+          Write-Host "Versioned release metadata updated."
 
       # ---------------------------------------------------------------
-      # Delete old assets when overwriting an existing release
+      # Delete old assets
       #
-      # Deleting all old assets also removes obsolete part files when
-      # the number of generated NSE or index parts changes.
+      # This removes obsolete part names when the number of archives
+      # changes between repeated executions of the same version.
       # ---------------------------------------------------------------
       - name: Delete old versioned release assets
         if: steps.release_state.outputs.exists == 'true'
@@ -825,7 +858,7 @@ jobs:
               --json assets
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Reading existing release assets failed."
+              throw "Reading existing versioned release assets failed."
           }
 
           $release = $releaseJson |
@@ -841,16 +874,16 @@ jobs:
 
               if ($LASTEXITCODE -ne 0) {
                   throw (
-                      "Deleting old asset failed: " +
+                      "Deleting old versioned release asset failed: " +
                       $asset.name
                   )
               }
           }
 
       # ---------------------------------------------------------------
-      # Upload rebuilt assets to an existing release
+      # Upload replacement assets
       # ---------------------------------------------------------------
-      - name: Upload replacement versioned assets
+      - name: Upload replacement versioned release assets
         if: steps.release_state.outputs.exists == 'true'
         shell: pwsh
         env:
@@ -860,8 +893,15 @@ jobs:
 
           $assets = @(
               Get-Content `
-                  -Path $env:RELEASE_ASSET_LIST
+                  -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              }
           )
+
+          if ($assets.Count -eq 0) {
+              throw "The replacement versioned asset list is empty."
+          }
 
           $arguments = @(
               "release",
@@ -874,13 +914,13 @@ jobs:
           & gh @arguments
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Uploading replacement release assets failed."
+              throw "Uploading replacement versioned release assets failed."
           }
 
-          Write-Host "Replacement assets uploaded."
+          Write-Host "Replacement versioned release assets uploaded."
 
       # ---------------------------------------------------------------
-      # Verify published release and all expected assets
+      # Verify release and assets
       # ---------------------------------------------------------------
       - name: Verify versioned release
         shell: pwsh
@@ -892,6 +932,9 @@ jobs:
           $expectedAssets = @(
               Get-Content `
                   -Path $env:RELEASE_ASSET_LIST |
+              Where-Object {
+                  -not [string]::IsNullOrWhiteSpace($_)
+              } |
               ForEach-Object {
                   Split-Path $_ -Leaf
               }
@@ -903,7 +946,7 @@ jobs:
               tagName,name,isDraft,isPrerelease,assets,url
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Reading the published versioned release failed."
+              throw "Reading the versioned release failed."
           }
 
           $release = $releaseJson |
@@ -919,7 +962,7 @@ jobs:
           foreach ($expectedAsset in $expectedAssets) {
               if ($expectedAsset -notin $publishedAssets) {
                   throw (
-                      "Expected release asset is missing: " +
+                      "Expected versioned release asset is missing: " +
                       $expectedAsset
                   )
               }
@@ -934,14 +977,14 @@ jobs:
 
           if ($unexpectedAssets.Count -gt 0) {
               throw (
-                  "Unexpected old release assets remain: " +
+                  "Unexpected old versioned release assets remain: " +
                   ($unexpectedAssets -join ", ")
               )
           }
 
           "RELEASE_URL=$($release.url)" >> $env:GITHUB_ENV
 
-          Write-Host "Release verification passed."
+          Write-Host "Versioned release verification passed."
           Write-Host "Release URL: $($release.url)"
 
       # ---------------------------------------------------------------
@@ -955,10 +998,10 @@ jobs:
               "${{ steps.release_state.outputs.exists }}" -eq
               "true"
           ) {
-              $operation = "Overwrote existing release"
+              $operation = "Overwrote existing versioned release"
           }
           else {
-              $operation = "Created new release"
+              $operation = "Created versioned release"
           }
 
           @"
