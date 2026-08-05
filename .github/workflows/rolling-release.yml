@@ -1,0 +1,487 @@
+name: Manual versioned NSE minute-data release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example v1.0.0"
+        required: true
+        type: string
+
+      release_title:
+        description: "Optional release title"
+        required: false
+        default: ""
+        type: string
+
+      prerelease:
+        description: "Mark as a pre-release"
+        required: true
+        default: false
+        type: boolean
+
+      make_latest:
+        description: "Mark as latest GitHub release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nse-minute-versioned-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TEMPLATE: .github/release-notes/version.md
+  RELEASE_ASSET_DIRECTORY: release-assets
+
+jobs:
+  versioned-release:
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Download Git LFS objects
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git lfs install
+          git lfs pull
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Downloading Git LFS objects failed."
+          }
+
+      - name: Validate version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = $env:INPUT_VERSION.Trim()
+
+          if (
+              $version -notmatch
+              '^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$'
+          ) {
+              throw "Invalid release version: $version"
+          }
+
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build consolidated release archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & ".\scripts\Build-ReleaseArchives.ps1" `
+              -OutputDirectory "release-assets" `
+              -MaximumArchiveBytes 2040109465 `
+              -PreferredBatchSourceBytes 1342177280
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Building release archives failed."
+          }
+
+      - name: Prepare license
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $licenseCandidates = @(
+              "LICENSE",
+              "LICENSE.txt",
+              "LICENSE.md"
+          )
+
+          $sourceLicense = $licenseCandidates |
+              Where-Object {
+                  Test-Path $_ -PathType Leaf
+              } |
+              Select-Object -First 1
+
+          if (-not $sourceLicense) {
+              throw "No license file was found."
+          }
+
+          $target = Join-Path `
+              $env:RELEASE_ASSET_DIRECTORY `
+              "LICENSE"
+
+          Copy-Item `
+              -Path $sourceLicense `
+              -Destination $target `
+              -Force
+
+          "RELEASE_LICENSE_ASSET=$target" >> $env:GITHUB_ENV
+
+      - name: Generate versioned release notes
+        shell: pwsh
+        env:
+          INPUT_RELEASE_TITLE: ${{ inputs.release_title }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path $env:RELEASE_TEMPLATE -PathType Leaf)) {
+              throw "Version release template was not found."
+          }
+
+          $manifest = Get-Content `
+              -Path $env:RELEASE_MANIFEST `
+              -Raw |
+              ConvertFrom-Json
+
+          $assetRows = @(
+              foreach ($asset in $manifest.assets) {
+                  $size = [Math]::Round(
+                      $asset.bytes / 1GB,
+                      3
+                  )
+
+                  "| ``$($asset.file)`` | $($asset.dataset) | " +
+                  "$($asset.sourceArchiveCount) | $size GiB |"
+              }
+          ) -join [Environment]::NewLine
+
+          $nseParts = @(
+              $manifest.assets |
+              Where-Object {
+                  $_.dataset -eq "NSE-Minute"
+              }
+          ).Count
+
+          $indexParts = @(
+              $manifest.assets |
+              Where-Object {
+                  $_.dataset -eq "NSE-Index-Minute"
+              }
+          ).Count
+
+          $utcNow = (Get-Date).ToUniversalTime()
+          $commit = "${{ github.sha }}"
+
+          $shortCommit = $commit.Substring(
+              0,
+              [Math]::Min(7, $commit.Length)
+          )
+
+          $notesPath = Join-Path `
+              $env:RELEASE_ASSET_DIRECTORY `
+              "RELEASE_NOTES-$env:RELEASE_VERSION.md"
+
+          $content = Get-Content `
+              -Path $env:RELEASE_TEMPLATE `
+              -Raw
+
+          $replacements = [ordered]@{
+              "{{VERSION}}"       = $env:RELEASE_VERSION
+              "{{DATE}}"          = $utcNow.ToString("yyyy-MM-dd")
+              "{{TIME}}"          = $utcNow.ToString("HH:mm:ss")
+              "{{COMMIT}}"        = $commit
+              "{{SHORT_COMMIT}}"  = $shortCommit
+              "{{NSE_PARTS}}"     = [string]$nseParts
+              "{{INDEX_PARTS}}"   = [string]$indexParts
+              "{{ASSET_COUNT}}"   = [string]$manifest.assets.Count
+              "{{ASSET_TABLE}}"   = $assetRows
+          }
+
+          foreach ($placeholder in $replacements.Keys) {
+              $content = $content.Replace(
+                  $placeholder,
+                  $replacements[$placeholder]
+              )
+          }
+
+          Set-Content `
+              -Path $notesPath `
+              -Value $content `
+              -Encoding utf8
+
+          $requestedTitle = $env:INPUT_RELEASE_TITLE.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($requestedTitle)) {
+              $releaseTitle = (
+                  "NSE One-Minute OHLCV Data " +
+                  $env:RELEASE_VERSION
+              )
+          }
+          else {
+              $releaseTitle = $requestedTitle
+          }
+
+          "RELEASE_NOTES=$notesPath" >> $env:GITHUB_ENV
+          "RELEASE_TITLE=$releaseTitle" >> $env:GITHUB_ENV
+
+      - name: Detect existing versioned release
+        id: release_state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view `
+              $env:RELEASE_VERSION `
+              --json tagName `
+              *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+              "exists=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+              "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Create or move version tag
+        shell: pwsh
+        env:
+          TARGET_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git tag `
+              --force `
+              $env:RELEASE_VERSION `
+              $env:TARGET_COMMIT
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Creating or updating the version tag failed."
+          }
+
+          git push `
+              origin `
+              "refs/tags/$env:RELEASE_VERSION" `
+              --force
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Pushing the version tag failed."
+          }
+
+      - name: Find versioned release assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $assets = @(
+              Get-ChildItem `
+                  -Path $env:RELEASE_ASSET_DIRECTORY `
+                  -File |
+              Where-Object {
+                  $_.Extension -eq ".zip" -or
+                  $_.Name -eq "RELEASE_MANIFEST.json" -or
+                  $_.Name -eq "SHA256SUMS.txt" -or
+                  $_.Name -eq "LICENSE" -or
+                  $_.Name -like "RELEASE_NOTES-*.md"
+              } |
+              Sort-Object Name
+          )
+
+          $assetListPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "versioned-assets.txt"
+
+          $assets.FullName |
+              Set-Content `
+                  -Path $assetListPath `
+                  -Encoding utf8
+
+          "RELEASE_ASSET_LIST=$assetListPath" >> $env:GITHUB_ENV
+
+      - name: Create versioned release
+        if: steps.release_state.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $assets = @(
+              Get-Content $env:RELEASE_ASSET_LIST
+          )
+
+          $arguments = @(
+              "release",
+              "create",
+              $env:RELEASE_VERSION
+          )
+
+          $arguments += $assets
+
+          $arguments += @(
+              "--title",
+              $env:RELEASE_TITLE,
+              "--notes-file",
+              $env:RELEASE_NOTES,
+              "--verify-tag"
+          )
+
+          if ($env:INPUT_PRERELEASE -eq "true") {
+              $arguments += "--prerelease"
+          }
+
+          if (
+              $env:INPUT_MAKE_LATEST -eq "true" -and
+              $env:INPUT_PRERELEASE -ne "true"
+          ) {
+              $arguments += "--latest"
+          }
+          else {
+              $arguments += "--latest=false"
+          }
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Creating versioned release failed."
+          }
+
+      - name: Update existing release metadata
+        if: steps.release_state.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_MAKE_LATEST: ${{ inputs.make_latest }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $arguments = @(
+              "release",
+              "edit",
+              $env:RELEASE_VERSION,
+              "--title",
+              $env:RELEASE_TITLE,
+              "--notes-file",
+              $env:RELEASE_NOTES
+          )
+
+          if ($env:INPUT_PRERELEASE -eq "true") {
+              $arguments += "--prerelease"
+          }
+          else {
+              $arguments += "--prerelease=false"
+          }
+
+          if (
+              $env:INPUT_MAKE_LATEST -eq "true" -and
+              $env:INPUT_PRERELEASE -ne "true"
+          ) {
+              $arguments += "--latest"
+          }
+          else {
+              $arguments += "--latest=false"
+          }
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Updating versioned release metadata failed."
+          }
+
+      - name: Delete old versioned assets
+        if: steps.release_state.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $release = gh release view `
+              $env:RELEASE_VERSION `
+              --json assets |
+              ConvertFrom-Json
+
+          foreach ($asset in $release.assets) {
+              gh release delete-asset `
+                  $env:RELEASE_VERSION `
+                  $asset.name `
+                  --yes
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw (
+                      "Deleting asset failed: " +
+                      $asset.name
+                  )
+              }
+          }
+
+      - name: Upload replacement versioned assets
+        if: steps.release_state.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $assets = @(
+              Get-Content $env:RELEASE_ASSET_LIST
+          )
+
+          $arguments = @(
+              "release",
+              "upload",
+              $env:RELEASE_VERSION
+          )
+
+          $arguments += $assets
+
+          & gh @arguments
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Uploading versioned assets failed."
+          }
+
+      - name: Verify versioned release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expectedAssets = @(
+              Get-Content $env:RELEASE_ASSET_LIST |
+              ForEach-Object {
+                  Split-Path $_ -Leaf
+              }
+          )
+
+          $release = gh release view `
+              $env:RELEASE_VERSION `
+              --json assets,url |
+              ConvertFrom-Json
+
+          $publishedAssets = @(
+              $release.assets.name
+          )
+
+          foreach ($asset in $expectedAssets) {
+              if ($asset -notin $publishedAssets) {
+                  throw "Missing published asset: $asset"
+              }
+          }
+
+          "RELEASE_URL=$($release.url)" >> $env:GITHUB_ENV
+
+      - name: Write workflow summary
+        if: success()
+        shell: pwsh
+        run: |
+          @"
+          ## NSE Minute Versioned Release
+
+          - **Version:** ``$env:RELEASE_VERSION``
+          - **Title:** $env:RELEASE_TITLE
+          - **Assets:** $env:RELEASE_ASSET_COUNT
+          - **Commit:** ``${{ github.sha }}``
+          - **Release:** $env:RELEASE_URL
+          "@ >> $env:GITHUB_STEP_SUMMARY
