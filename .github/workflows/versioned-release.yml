@@ -661,7 +661,7 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      # Detect existing release
+      # Detect existing versioned release
       # ---------------------------------------------------------------
       - name: Detect existing versioned release
         id: release_state
@@ -671,19 +671,67 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          gh release view `
-              $env:RELEASE_VERSION `
-              --json tagName `
-              *> $null
+          $previousNativePreference = `
+              $PSNativeCommandUseErrorActionPreference
 
-          if ($LASTEXITCODE -eq 0) {
-              Write-Host "Versioned release already exists."
-              "exists=true" >> $env:GITHUB_OUTPUT
+          try {
+              $PSNativeCommandUseErrorActionPreference = $false
+
+              gh release view `
+                  $env:RELEASE_VERSION `
+                  --json tagName `
+                  *> $null
+
+              $releaseViewExitCode = $LASTEXITCODE
           }
-          else {
-              Write-Host "Versioned release does not exist."
-              "exists=false" >> $env:GITHUB_OUTPUT
+          finally {
+              $PSNativeCommandUseErrorActionPreference = `
+                  $previousNativePreference
           }
+
+          # GitHub Actions may use the final native exit code as the
+          # PowerShell step's result. Clear the expected exit code from
+          # a missing release before continuing.
+          $global:LASTEXITCODE = 0
+
+          switch ($releaseViewExitCode) {
+              0 {
+                  Write-Host (
+                      "Versioned release already exists: " +
+                      $env:RELEASE_VERSION
+                  )
+
+                  "exists=true" >> $env:GITHUB_OUTPUT
+              }
+
+              1 {
+                  Write-Host (
+                      "Versioned release does not exist: " +
+                      $env:RELEASE_VERSION
+                  )
+
+                  "exists=false" >> $env:GITHUB_OUTPUT
+              }
+
+              4 {
+                  throw (
+                      "GitHub CLI authentication failed while checking " +
+                      "release $env:RELEASE_VERSION."
+                  )
+              }
+
+              default {
+                  throw (
+                      "Unable to check release existence. " +
+                      "gh release view returned exit code " +
+                      $releaseViewExitCode
+                  )
+              }
+          }
+
+          # Ensure this step exits successfully for both existing and
+          # missing releases.
+          $global:LASTEXITCODE = 0
 
       # ---------------------------------------------------------------
       # Create or force-move version tag

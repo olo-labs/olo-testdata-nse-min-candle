@@ -654,7 +654,7 @@ jobs:
               Write-Host " - $($asset.Name): $sizeMiB MiB"
           }
 
-      # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
       # Detect existing rolling release
       # ---------------------------------------------------------------
       - name: Detect existing rolling release
@@ -665,19 +665,62 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          gh release view `
-              $env:RELEASE_TAG `
-              --json tagName `
-              *> $null
+          $previousNativePreference = `
+              $PSNativeCommandUseErrorActionPreference
 
-          if ($LASTEXITCODE -eq 0) {
-              Write-Host "Rolling release already exists."
-              "exists=true" >> $env:GITHUB_OUTPUT
+          try {
+              $PSNativeCommandUseErrorActionPreference = $false
+
+              gh release view `
+                  $env:RELEASE_TAG `
+                  --json tagName `
+                  *> $null
+
+              $releaseViewExitCode = $LASTEXITCODE
           }
-          else {
-              Write-Host "Rolling release does not exist."
-              "exists=false" >> $env:GITHUB_OUTPUT
+          finally {
+              $PSNativeCommandUseErrorActionPreference = `
+                  $previousNativePreference
           }
+
+          $global:LASTEXITCODE = 0
+
+          switch ($releaseViewExitCode) {
+              0 {
+                  Write-Host (
+                      "Rolling release already exists: " +
+                      $env:RELEASE_TAG
+                  )
+
+                  "exists=true" >> $env:GITHUB_OUTPUT
+              }
+
+              1 {
+                  Write-Host (
+                      "Rolling release does not exist: " +
+                      $env:RELEASE_TAG
+                  )
+
+                  "exists=false" >> $env:GITHUB_OUTPUT
+              }
+
+              4 {
+                  throw (
+                      "GitHub CLI authentication failed while checking " +
+                      "rolling release $env:RELEASE_TAG."
+                  )
+              }
+
+              default {
+                  throw (
+                      "Unable to check rolling release existence. " +
+                      "gh release view returned exit code " +
+                      $releaseViewExitCode
+                  )
+              }
+          }
+
+          $global:LASTEXITCODE = 0
 
       # ---------------------------------------------------------------
       # Create or force-move rolling tag
