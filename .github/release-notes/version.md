@@ -15,9 +15,11 @@ commit `{{SHORT_COMMIT}}`.
 
 ## Archive assets
 
-| Asset           | Dataset | Daily source ZIPs | Size |
-| --------------- | ------- | ----------------: | ---: |
-| {{ASSET_TABLE}} |         |                   |      |
+## Archive assets
+
+| Asset | Dataset | Daily source ZIPs | Size |
+|---|---|---:|---:|
+{{ASSET_TABLE}}
 
 ## Archive structure
 

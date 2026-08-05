@@ -17,11 +17,11 @@ dataset produced from repository commit `{{SHORT_COMMIT}}`.
 * **Source commit:** `{{COMMIT}}`
 
 ## Archive assets
+## Archive assets
 
-| Asset           | Dataset | Daily source ZIPs | Size |
-| --------------- | ------- | ----------------: | ---: |
-| {{ASSET_TABLE}} |         |                   |      |
-
+| Asset | Dataset | Daily source ZIPs | Size |
+|---|---|---:|---:|
+{{ASSET_TABLE}}
 ## Archive structure
 
 NSE stock and other exchange-traded instrument data is packaged separately from

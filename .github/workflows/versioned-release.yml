@@ -41,7 +41,7 @@ env:
   MAXIMUM_ARCHIVE_BYTES: "2040109465"
 
   # Conservative initial target based on extracted CSV size.
-  TARGET_UNCOMPRESSED_BYTES: "1800000000"
+  TARGET_UNCOMPRESSED_BYTES: "12000000000"
 
   # Prevent accidental generation of one archive per trading day.
   MAXIMUM_DATA_ARCHIVE_COUNT: "30"
