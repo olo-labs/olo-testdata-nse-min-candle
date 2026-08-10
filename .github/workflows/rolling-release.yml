@@ -1012,3 +1012,44 @@ jobs:
           - **Commit:** ``${{ github.sha }}``
           - **Release:** $env:RELEASE_URL
           "@ >> $env:GITHUB_STEP_SUMMARY
+
+      # A submodule commit does not trigger workflows in its parent repository.
+      # Dispatch the exact released commit after this release is verified.
+      - name: Trigger parent database rolling release
+        if: success() && github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PARENT_REPO_TOKEN }}
+          PARENT_REPOSITORY: olo-labs/olo-testdata-nse
+          RELEASED_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+              throw @"
+          PARENT_REPO_TOKEN is not configured.
+
+          Add a fine-grained token with Contents write access to
+          olo-labs/olo-testdata-nse as a repository secret in this repository.
+          "@
+          }
+
+          $payload = @{
+              event_type = "min-candle-rc"
+              client_payload = @{
+                  min_candle_sha = "${{ github.sha }}"
+                  commit_message = $env:RELEASED_COMMIT_MESSAGE
+                  source_run_url = (
+                      "${{ github.server_url }}/${{ github.repository }}" +
+                      "/actions/runs/${{ github.run_id }}"
+                  )
+              }
+          } | ConvertTo-Json -Depth 5 -Compress
+
+          $payload | gh api `
+              --method POST `
+              -H "Accept: application/vnd.github+json" `
+              "repos/$env:PARENT_REPOSITORY/dispatches" `
+              --input -
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Triggering the parent database release failed."
+          }
